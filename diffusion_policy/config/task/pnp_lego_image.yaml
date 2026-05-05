@@ -1,0 +1,25 @@
+name: pnp_lego_image
+
+image_shape: [3, 360, 640]
+dataset_path: data/pnp_red_lego_to_brown_bowl/replay.zarr
+
+shape_meta: &shape_meta
+  obs:
+    image:
+      shape: ${task.image_shape}
+      type: rgb
+  action:
+    shape: [7]
+
+env_runner:
+  _target_: diffusion_policy.env_runner.real_pusht_image_runner.RealPushTImageRunner
+
+dataset:
+  _target_: diffusion_policy.dataset.pnp_lego_image_dataset.PnPLegoImageDataset
+  zarr_path: ${task.dataset_path}
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: 42
+  val_ratio: 0.05
+  max_train_episodes: null

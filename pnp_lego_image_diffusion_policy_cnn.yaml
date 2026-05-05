@@ -1,0 +1,158 @@
+_target_: diffusion_policy.workspace.train_diffusion_unet_hybrid_workspace.TrainDiffusionUnetHybridWorkspace
+checkpoint:
+  save_last_ckpt: true
+  save_last_snapshot: false
+  topk:
+    format_str: epoch={epoch:04d}-train_loss={train_loss:.4f}.ckpt
+    k: 5
+    mode: min
+    monitor_key: train_loss
+dataloader:
+  batch_size: 64
+  num_workers: 4
+  persistent_workers: true
+  pin_memory: false
+  shuffle: true
+dataset_obs_steps: 2
+ema:
+  _target_: diffusion_policy.model.diffusion.ema_model.EMAModel
+  inv_gamma: 1.0
+  max_value: 0.9999
+  min_value: 0.0
+  power: 0.75
+  update_after_step: 0
+exp_name: pnp_lego_image
+horizon: 32
+keypoint_visible_rate: 1.0
+logging:
+  group: null
+  id: null
+  mode: online
+  name: pnp_lego_image_diffusion_policy_cnn
+  project: diffusion_policy_pnp_lego
+  resume: true
+  tags:
+  - train_diffusion_unet_hybrid
+  - pnp_lego_image
+  - default
+multi_run:
+  run_dir: data/outputs/pnp_lego_image_diffusion_policy_cnn
+  wandb_name_base: pnp_lego_image_diffusion_policy_cnn
+n_action_steps: 16
+n_latency_steps: 0
+n_obs_steps: 2
+name: train_diffusion_unet_hybrid
+obs_as_global_cond: true
+optimizer:
+  _target_: torch.optim.AdamW
+  betas:
+  - 0.95
+  - 0.999
+  eps: 1.0e-08
+  lr: 0.00012
+  weight_decay: 1.0e-06
+past_action_visible: false
+policy:
+  _target_: diffusion_policy.policy.diffusion_unet_hybrid_image_policy.DiffusionUnetHybridImagePolicy
+  cond_predict_scale: true
+  crop_shape:
+  - 336
+  - 600
+  diffusion_step_embed_dim: 128
+  down_dims:
+  - 512
+  - 1024
+  - 2048
+  eval_fixed_crop: true
+  horizon: 32
+  kernel_size: 5
+  n_action_steps: 16
+  n_groups: 8
+  n_obs_steps: 2
+  noise_scheduler:
+    _target_: diffusers.schedulers.scheduling_ddpm.DDPMScheduler
+    beta_end: 0.02
+    beta_schedule: squaredcos_cap_v2
+    beta_start: 0.0001
+    clip_sample: true
+    num_train_timesteps: 100
+    prediction_type: epsilon
+    variance_type: fixed_small
+  num_inference_steps: 100
+  obs_as_global_cond: true
+  obs_encoder_group_norm: true
+  shape_meta:
+    action:
+      shape:
+      - 7
+    obs:
+      image:
+        shape:
+        - 3
+        - 360
+        - 640
+        type: rgb
+shape_meta:
+  action:
+    shape:
+    - 7
+  obs:
+    image:
+      shape:
+      - 3
+      - 360
+      - 640
+      type: rgb
+task:
+  name: pnp_lego_image
+  image_shape:
+  - 3
+  - 360
+  - 640
+  dataset_path: data/pnp_red_lego_to_brown_bowl/replay.zarr
+  shape_meta:
+    action:
+      shape:
+      - 7
+    obs:
+      image:
+        shape:
+        - 3
+        - 360
+        - 640
+        type: rgb
+  env_runner:
+    _target_: diffusion_policy.env_runner.real_pusht_image_runner.RealPushTImageRunner
+  dataset:
+    _target_: diffusion_policy.dataset.pnp_lego_image_dataset.PnPLegoImageDataset
+    zarr_path: data/pnp_red_lego_to_brown_bowl/replay.zarr
+    horizon: 32
+    pad_before: 1
+    pad_after: 15
+    seed: 42
+    val_ratio: 0.05
+    max_train_episodes: null
+task_name: pnp_lego_image
+training:
+  checkpoint_every: 50
+  debug: false
+  device: cuda:0
+  gradient_accumulate_every: 1
+  lr_scheduler: cosine
+  lr_warmup_steps: 500
+  max_train_steps: null
+  max_val_steps: null
+  num_epochs: 3050
+  resume: true
+  rollout_every: 50
+  sample_every: 5
+  seed: 42
+  tqdm_interval_sec: 1.0
+  use_ema: true
+  val_every: 1
+val_dataloader:
+  batch_size: 64
+  num_workers: 4
+  persistent_workers: true
+  pin_memory: false
+  shuffle: false
