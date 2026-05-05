@@ -9,6 +9,12 @@ import dill
 import torch
 import threading
 
+try:
+    from accelerate.utils import extract_model_from_parallel
+except ImportError:
+    def extract_model_from_parallel(m):
+        return m
+
 
 class BaseWorkspace:
     include_keys = tuple()
@@ -56,10 +62,13 @@ class BaseWorkspace:
             if hasattr(value, 'state_dict') and hasattr(value, 'load_state_dict'):
                 # modules, optimizers and samplers etc
                 if key not in exclude_keys:
+                    # Unwrap DDP/accelerate-wrapped modules so saved keys
+                    # match the single-GPU layout (no `module.` prefix).
+                    save_target = extract_model_from_parallel(value)
                     if use_thread:
-                        payload['state_dicts'][key] = _copy_to_cpu(value.state_dict())
+                        payload['state_dicts'][key] = _copy_to_cpu(save_target.state_dict())
                     else:
-                        payload['state_dicts'][key] = value.state_dict()
+                        payload['state_dicts'][key] = save_target.state_dict()
             elif key in include_keys:
                 payload['pickles'][key] = dill.dumps(value)
         if use_thread:
@@ -81,7 +90,8 @@ class BaseWorkspace:
 
         for key, value in payload['state_dicts'].items():
             if key not in exclude_keys:
-                self.__dict__[key].load_state_dict(value, **kwargs)
+                load_target = extract_model_from_parallel(self.__dict__[key])
+                load_target.load_state_dict(value, **kwargs)
         for key in include_keys:
             if key in payload['pickles']:
                 self.__dict__[key] = dill.loads(payload['pickles'][key])

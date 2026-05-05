@@ -14,23 +14,11 @@ LOCAL-EVERYTHING SETUP (camera + GPU + robot all on one box):
             -i data/jgd/.../checkpoints/<ckpt>.ckpt
 
 REMOTE-GPU SETUP (camera + robot here, GPU on cv12):
-    Local terminal 1: follower (as above)
+ssh -N -R 11333:127.0.0.1:11333 -R 11335:127.0.0.1:11335 sruthi@cv12.cs.columbia.edu
 
-    Local terminal 2: camera server
-        cd /home/cvlabusers/Appaji/i2rt && source .venv/bin/activate
-        python /home/cvlabusers/Appaji/diffusion_policy/scripts_pnp_lego/camera_server.py
+python /home/cvlabusers/Appaji/diffusion_policy/scripts_pnp_lego/camera_server.py
 
-    Local terminal 3: SSH reverse tunnel
-        ssh -N -R 11333:127.0.0.1:11333 -R 11335:127.0.0.1:11335 \\
-            sruthi@cv12.cs.columbia.edu
-
-    cv12 terminal: inference, pulling frames over the tunnel
-        cd <repo on cv12>
-        python run_diffusion_policy.py \\
-            -i <ckpt> \\
-            --frame-source remote \\
-            --frame-host 127.0.0.1 --frame-port 11335 \\
-            --server-host 127.0.0.1 --server-port 11333
+python /home/cvlabusers/Appaji/i2rt/examples/minimum_gello/minimum_gello.py --gripper linear_4310 --mode follower --can-channel can0 --bilateral_kp 0.2
 
 python run_diffusion_policy.py \
 -i data/jgd/2026.05.05/13.22.36_train_diffusion_unet_hybrid_pnp_lego_image/checkpoints/epoch=0000-train_loss=0.6701.ckpt \
@@ -172,6 +160,26 @@ def main(ckpt_path, server_host, server_port,
         raise RuntimeError(
             f'Follower DOF ({cur.shape[0]}) != policy action_dim ({policy.action_dim}). '
             'Check the follower\'s gripper config.')
+
+    # 2b. Move follower to the fixed start pose
+    start_pose = np.array([
+        -0.02651255, 1.53639277, 1.49328603, -1.66189822,
+        0.02994583, 0.05359731, 0.99420248,
+    ], dtype=np.float64)
+    if start_pose.shape[0] != policy.action_dim:
+        raise RuntimeError(
+            f'Start pose dim ({start_pose.shape[0]}) != policy action_dim ({policy.action_dim}).')
+    print(f'Moving follower to start pose: {start_pose}')
+    settle_dt = 1.0 / frequency
+    while True:
+        cur = client.get_joint_pos().result()
+        diff = start_pose - cur
+        if np.max(np.abs(diff)) < 1e-3:
+            break
+        step = np.clip(diff, -max_step_rad, max_step_rad)
+        client.command_joint_pos(cur + step)
+        time.sleep(settle_dt)
+    print(f'Reached start pose: {client.get_joint_pos().result()}')
 
     # 3. Frame source
     if frame_source == 'local':
