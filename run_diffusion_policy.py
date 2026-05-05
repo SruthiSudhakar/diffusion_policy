@@ -31,11 +31,22 @@ REMOTE-GPU SETUP (camera + robot here, GPU on cv12):
             --frame-source remote \\
             --frame-host 127.0.0.1 --frame-port 11335 \\
             --server-host 127.0.0.1 --server-port 11333
+
+python run_diffusion_policy.py \
+-i data/jgd/2026.05.05/13.22.36_train_diffusion_unet_hybrid_pnp_lego_image/checkpoints/epoch=0000-train_loss=0.6701.ckpt \
+--frame-source remote \
+--frame-host 127.0.0.1 --frame-port 11335 \
+--server-host 127.0.0.1 --server-port 11333 \
+--dry-run
+
+
 """
 import sys
 sys.stdout = open(sys.stdout.fileno(), mode='w', buffering=1)
 sys.stderr = open(sys.stderr.fileno(), mode='w', buffering=1)
 
+import datetime
+import pathlib
 import time
 from collections import deque
 
@@ -121,10 +132,14 @@ def make_remote_grab(frame_host, frame_port):
                    'Set very high to disable.')
 @click.option('--dry-run', is_flag=True, default=False,
               help='Run inference but do not send commands to the robot.')
+@click.option('--record/--no-record', default=True,
+              help='Save each policy-input image (640x360 RGB JPEG) to disk under '
+                   '<ckpt_dir>/<ckpt_stem>/<YYYY-mm-dd_HH-MM-SS>/. On by default.')
+@click.option('--record-jpeg-quality', default=95, type=int)
 def main(ckpt_path, server_host, server_port,
          frame_source, frame_host, frame_port,
          frequency, steps_per_inference, rs_width, rs_height, rs_fps,
-         device, max_step_rad, dry_run):
+         device, max_step_rad, dry_run, record, record_jpeg_quality):
     # 1. Load checkpoint
     print(f'Loading checkpoint: {ckpt_path}')
     payload = torch.load(open(ckpt_path, 'rb'), pickle_module=dill, map_location='cpu')
@@ -164,13 +179,37 @@ def main(ckpt_path, server_host, server_port,
     else:
         grab, stop_camera = make_remote_grab(frame_host, frame_port)
 
+    # 3b. Set up recording directory
+    record_dir = None
+    frame_idx = 0
+    if record:
+        ckpt = pathlib.Path(ckpt_path).resolve()
+        run_stamp = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+        record_dir = ckpt.parent / ckpt.stem / run_stamp
+        record_dir.mkdir(parents=True, exist_ok=True)
+        print(f'Recording image observations to {record_dir}')
+
+    def save_obs(frame_chw_float: np.ndarray) -> None:
+        """Persist the policy-input frame (3,360,640) RGB float32 [0,1] as JPEG."""
+        nonlocal frame_idx
+        if record_dir is None:
+            return
+        rgb = (frame_chw_float.transpose(1, 2, 0) * 255.0).clip(0, 255).astype(np.uint8)
+        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        out = record_dir / f'frame_{frame_idx:06d}.jpg'
+        cv2.imwrite(str(out), bgr,
+                    [int(cv2.IMWRITE_JPEG_QUALITY), record_jpeg_quality])
+        frame_idx += 1
+
     dt = 1.0 / frequency
 
     # 4. Warm up obs buffer
     print(f'Warming up {n_obs}-frame observation buffer...')
     obs_buf = deque(maxlen=n_obs)
     for _ in range(n_obs):
-        obs_buf.append(grab())
+        f = grab()
+        obs_buf.append(f)
+        save_obs(f)
         time.sleep(dt)
 
     print(f'Starting policy at {frequency} Hz, {steps_per_inference} actions per inference. '
@@ -194,7 +233,9 @@ def main(ckpt_path, server_host, server_port,
                 if not dry_run:
                     client.command_joint_pos(cmd)
 
-                obs_buf.append(grab())
+                f = grab()
+                obs_buf.append(f)
+                save_obs(f)
                 rem = dt - (time.time() - tick)
                 if rem > 0:
                     time.sleep(rem)
