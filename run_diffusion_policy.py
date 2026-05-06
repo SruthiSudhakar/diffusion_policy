@@ -34,6 +34,12 @@ python run_diffusion_policy.py \
 --num-inference-steps 16 \
 --dry-run
 
+local run: 
+python /home/cvlabusers/Appaji/i2rt/examples/minimum_gello/minimum_gello.py --gripper linear_4310 --mode follower --can-channel can0 --bilateral_kp 0.2                                          
+python run_diffusion_policy.py \
+-i /home/cvlabusers/Appaji/diffusion_policy/data/jgd/2026.05.05/17.36.50_train_diffusion_unet_hybrid_pnp_lego_image/checkpoints/epoch=0600-train_loss=0.0072.ckpt \
+--frame-source local --server-host 127.0.0.1 --server-port 11333 \
+--num-inference-steps 16 --max-joint-speed 3.0 --dry-run
 
 """
 import sys
