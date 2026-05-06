@@ -1,42 +1,28 @@
 1. One-time data conversion:
- /proj/vondrick3/sruthi/miniconda3/envs/vllm_server/bin/python \
-     scripts_pnp_lego/convert_pnp_to_zarr.py \
-     --src /proj/vondrick3/datasets/VLMjgd/PnPRedLegoToBrownBowl \
-     --dst data/pnp_red_lego_to_brown_bowl/replay.zarr \
-     --image-size 640 360 --subsample 3 --success-only
+python scripts_pnp_lego/convert_pnp_to_zarr.py \
+--src /proj/vondrick3/datasets/VLMjgd/PnPRedLegoToBrownBowl \
+--dst data/pnp_red_lego_to_brown_bowl/replay_200ex.zarr \
+--image-size 640 360 --subsample 3 --success-only
 
-  To rebuild the zarr (e.g. different image size)
-  rm -rf data/pnp_red_lego_to_brown_bowl/replay.zarr
-  /proj/vondrick3/sruthi/miniconda3/envs/jgdrobodiff/bin/python \
-      scripts_pnp_lego/convert_pnp_to_zarr.py --image-size 320 240 --subsample 3
-
-2. convert all images to zarr: (No need to run)
-cd /proj/vondrick3/sruthi/Appaji/diffusion_policy
-conda activate jgdrobodiff   # or robodiff if Step 1 took the fallback
-python train.py \
-    --config-dir=. \
-    --config-name=pnp_lego_image_diffusion_policy_cnn.yaml \
-    training.seed=42 training.device=cuda:0 \
-    hydra.run.dir='data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}'
-
-3. Training:
+2. Training:
 cd /proj/vondrick3/sruthi/Appaji/diffusion_policy
 conda activate jgdrobodiff
-python train.py --config-dir=. --config-name=pnp_lego_image_diffusion_policy_cnn.yaml training.seed=42 training.device=cuda:0 hydra.run.dir='data/jgd/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}'
-Training Multigpu:
-multi-gpu:
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 OMP_NUM_THREADS=4 TOKENIZERS_PARALLELISM=false \
+
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,6,7 OMP_NUM_THREADS=4 TOKENIZERS_PARALLELISM=false \
 accelerate launch --config_file accelerate_config.yaml --num_processes 8 \
 train.py --config-dir=. \
 --config-name=pnp_lego_image_diffusion_policy_cnn.yaml \
 training.seed=42 \
 'hydra.run.dir=data/jgd/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}'
 
+Resume training:
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,6,7 OMP_NUM_THREADS=4 TOKENIZERS_PARALLELISM=false \
+accelerate launch --config_file accelerate_config.yaml --num_processes 7 \
+train.py --config-dir=. \
+--config-name=pnp_lego_image_diffusion_policy_cnn.yaml \
+training.seed=42 \
+hydra.run.dir=data/jgd/2026.05.05/17.36.50_train_diffusion_unet_hybrid_pnp_lego_image
 
-
-4.Differences Notes:
+3.Differences Notes:
 1. image augmentations - random crop 336x600
 2. horizon 32, actions 8
-
-
-5. Claude Todos:

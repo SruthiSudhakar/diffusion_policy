@@ -14,6 +14,12 @@ LOCAL-EVERYTHING SETUP (camera + GPU + robot all on one box):
             -i data/jgd/.../checkpoints/<ckpt>.ckpt
 
 REMOTE-GPU SETUP (camera + robot here, GPU on cv12):
+debug witgh echo_test.py
+
+ps -u $USER -o pid,etime,cmd | grep -E 'sshd|ssh '
+kill <PID>
+ss -ltnp | grep -E '11333|11335'
+
 ssh -N -R 11333:127.0.0.1:11333 -R 11335:127.0.0.1:11335 sruthi@cv12.cs.columbia.edu
 
 python /home/cvlabusers/Appaji/diffusion_policy/scripts_pnp_lego/camera_server.py
@@ -21,10 +27,11 @@ python /home/cvlabusers/Appaji/diffusion_policy/scripts_pnp_lego/camera_server.p
 python /home/cvlabusers/Appaji/i2rt/examples/minimum_gello/minimum_gello.py --gripper linear_4310 --mode follower --can-channel can0 --bilateral_kp 0.2
 
 python run_diffusion_policy.py \
--i data/jgd/2026.05.05/13.22.36_train_diffusion_unet_hybrid_pnp_lego_image/checkpoints/epoch=0000-train_loss=0.6701.ckpt \
+-i /proj/vondrick3/sruthi/Appaji/diffusion_policy/data/jgd/2026.05.05/17.36.50_train_diffusion_unet_hybrid_pnp_lego_image/checkpoints/epoch=0800-train_loss=0.0071.ckpt \
 --frame-source remote \
 --frame-host 127.0.0.1 --frame-port 11335 \
 --server-host 127.0.0.1 --server-port 11333 \
+--num-inference-steps 32 \
 --dry-run
 
 
@@ -115,9 +122,22 @@ def make_remote_grab(frame_host, frame_port):
 @click.option('--rs-height', default=720, type=int)
 @click.option('--rs-fps', default=30, type=int)
 @click.option('--device', default='auto', help="'auto' picks cuda:0 if available else cpu.")
-@click.option('--max-step-rad', default=0.15, type=float,
-              help='Per-tick safety clamp on |target - current| per joint, in radians. '
-                   'Set very high to disable.')
+@click.option('--num-inference-steps', default=16, type=int,
+              help='Diffusion sampling steps. Training default (100, DDPM) is too slow '
+                   'for real-time 10 Hz; eval_real_robot.py uses 16 (DDIM-style).')
+@click.option('--scheduler', type=click.Choice(['keep', 'ddpm', 'ddim']),
+              default='ddim',
+              help="Inference scheduler. 'ddim' (default) rebuilds a DDIM "
+                   "scheduler from the trained DDPM config — required for "
+                   "sub-100-step sampling. 'keep' leaves the trained "
+                   "scheduler untouched (subsampled DDPM, much worse "
+                   "below 100 steps). 'ddpm' explicitly forces DDPM.")
+@click.option('--max-joint-speed', default=1.0, type=float,
+              help='Per-joint L_inf speed cap (rad/s) passed to the i2rt '
+                   'server-side interpolator. Lengthens scheduled waypoint '
+                   'durations when the policy commands too aggressively.')
+@click.option('--start-pose-ramp-sec', default=2.0, type=float,
+              help='Wall-clock duration for the smooth ramp to start_pose at boot.')
 @click.option('--dry-run', is_flag=True, default=False,
               help='Run inference but do not send commands to the robot.')
 @click.option('--record/--no-record', default=True,
@@ -127,7 +147,9 @@ def make_remote_grab(frame_host, frame_port):
 def main(ckpt_path, server_host, server_port,
          frame_source, frame_host, frame_port,
          frequency, steps_per_inference, rs_width, rs_height, rs_fps,
-         device, max_step_rad, dry_run, record, record_jpeg_quality):
+         device, num_inference_steps, scheduler,
+         max_joint_speed, start_pose_ramp_sec,
+         dry_run, record, record_jpeg_quality):
     # 1. Load checkpoint
     print(f'Loading checkpoint: {ckpt_path}')
     payload = torch.load(open(ckpt_path, 'rb'), pickle_module=dill, map_location='cpu')
@@ -144,6 +166,43 @@ def main(ckpt_path, server_host, server_port,
               'over a 250M-param UNet — expect many seconds per chunk, so real-time '
               '10 Hz control will not be possible.')
     policy.to(device_t).eval()
+    if hasattr(policy, 'num_inference_steps'):
+        old_steps = policy.num_inference_steps
+        policy.num_inference_steps = num_inference_steps
+        print(f'Set policy.num_inference_steps: {old_steps} -> {num_inference_steps}')
+    if scheduler != 'keep' and hasattr(policy, 'noise_scheduler'):
+        # DDPM and DDIM share the forward noising process and the epsilon-
+        # prediction objective, so a DDPM-trained model samples correctly
+        # under DDIM as long as the betas / num_train_timesteps / prediction
+        # type match. eta=0 (DDIM default) -> deterministic sampler.
+        old_sched = policy.noise_scheduler
+        old_cfg = old_sched.config
+        if scheduler == 'ddim':
+            from diffusers.schedulers.scheduling_ddim import DDIMScheduler
+            new_sched = DDIMScheduler(
+                num_train_timesteps=old_cfg.num_train_timesteps,
+                beta_start=old_cfg.beta_start,
+                beta_end=old_cfg.beta_end,
+                beta_schedule=old_cfg.beta_schedule,
+                clip_sample=old_cfg.clip_sample,
+                prediction_type=old_cfg.prediction_type,
+                set_alpha_to_one=True,
+                steps_offset=0,
+            )
+        else:
+            from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
+            new_sched = DDPMScheduler(
+                num_train_timesteps=old_cfg.num_train_timesteps,
+                beta_start=old_cfg.beta_start,
+                beta_end=old_cfg.beta_end,
+                beta_schedule=old_cfg.beta_schedule,
+                clip_sample=old_cfg.clip_sample,
+                prediction_type=old_cfg.prediction_type,
+                variance_type=getattr(old_cfg, 'variance_type', 'fixed_small'),
+            )
+        policy.noise_scheduler = new_sched
+        print(f'Swapped scheduler: {type(old_sched).__name__} -> '
+              f'{type(new_sched).__name__}')
     n_obs = policy.n_obs_steps
     n_act = policy.n_action_steps
     print(f'Policy ready: n_obs_steps={n_obs}, n_action_steps={n_act}, action_dim={policy.action_dim}')
@@ -169,16 +228,17 @@ def main(ckpt_path, server_host, server_port,
     if start_pose.shape[0] != policy.action_dim:
         raise RuntimeError(
             f'Start pose dim ({start_pose.shape[0]}) != policy action_dim ({policy.action_dim}).')
-    print(f'Moving follower to start pose: {start_pose}')
-    settle_dt = 1.0 / frequency
-    while True:
-        cur = client.get_joint_pos().result()
-        diff = start_pose - cur
-        if np.max(np.abs(diff)) < 1e-3:
-            break
-        step = np.clip(diff, -max_step_rad, max_step_rad)
-        client.command_joint_pos(cur + step)
-        time.sleep(settle_dt)
+    # Use the server-side trajectory interpolator: schedule one waypoint at
+    # start_pose with a generous wall-clock arrival time, and the i2rt
+    # MotorChainRobot's 250 Hz tick produces a smooth ramp on the wire.
+    print(f'Moving follower to start pose over {start_pose_ramp_sec:.2f}s: {start_pose}')
+    client.clear_waypoints()
+    client.schedule_waypoint(
+        start_pose,
+        time.time() + start_pose_ramp_sec,
+        max_joint_speed,
+    )
+    time.sleep(start_pose_ramp_sec + 0.2)
     print(f'Reached start pose: {client.get_joint_pos().result()}')
 
     # 3. Frame source
@@ -222,25 +282,57 @@ def main(ckpt_path, server_host, server_port,
 
     print(f'Starting policy at {frequency} Hz, {steps_per_inference} actions per inference. '
           f'Ctrl+C to stop and hold pose.{" (DRY RUN — no commands sent)" if dry_run else ""}')
+
+    # Reset the server-side interpolator so the policy episode starts from a
+    # clean schedule seeded at the current measured pose.
+    if not dry_run:
+        client.clear_waypoints()
+    eval_t_start = time.time() + 0.5
+    iter_idx = 0
+    action_exec_latency = 0.01  # seconds; matches eval_real_robot.py:324
+
     try:
         while True:
-            # 5. Inference
+            # ---- 5. Inference at `frequency` Hz ----
             obs_np = np.stack(list(obs_buf), axis=0)[None, ...]  # (1, n_obs, 3, 360, 640)
+            obs_anchor_time = time.time()
             with torch.no_grad():
                 obs_t = torch.from_numpy(obs_np).to(device_t)
                 pred = policy.predict_action({'image': obs_t})
             actions = pred['action'][0].cpu().numpy()  # (n_act, 7)
+            inference_latency = time.time() - obs_anchor_time
 
-            # 6. Stream actions at control rate, refreshing obs each tick
-            for k in range(steps_per_inference):
+            # Wall-clock target time for each action: spaced by dt, anchored at
+            # the obs that produced them. Mirrors eval_real_robot.py:286-347.
+            action_ts = np.arange(len(actions), dtype=np.float64) * dt + obs_anchor_time + dt
+
+            # Receding-horizon: drop any whose target_time is already in the past
+            # (after a small allowance for one-way RPC latency).
+            now = time.time()
+            is_new = action_ts > (now + action_exec_latency)
+            sched_actions = actions[is_new]
+            sched_ts = action_ts[is_new]
+
+            if len(sched_actions) == 0:
+                # The whole chunk is stale (inference too slow). Push the last
+                # one onto the next available step so we don't stall.
+                next_step_idx = int(np.ceil((now - eval_t_start) / dt))
+                sched_actions = actions[[-1]]
+                sched_ts = np.array([eval_t_start + next_step_idx * dt], dtype=np.float64)
+                print(f'Over budget (inference={inference_latency*1000:.0f}ms > {n_act*dt*1000:.0f}ms horizon); '
+                      f'fallback at t+{sched_ts[0]-now:.3f}s')
+            else:
+                print(f'inference={inference_latency*1000:.0f}ms, scheduled {len(sched_actions)}/{len(actions)} waypoints')
+
+            if not dry_run:
+                for q, t_target in zip(sched_actions, sched_ts):
+                    client.schedule_waypoint(q, float(t_target), max_joint_speed)
+
+            # ---- 6. Refill the obs buffer at ~`frequency` Hz until next inference ----
+            iter_idx += steps_per_inference
+            next_inference_t = eval_t_start + iter_idx * dt
+            while time.time() < next_inference_t - dt * 0.5:
                 tick = time.time()
-                target = actions[k]
-                cur = client.get_joint_pos().result()
-                step = np.clip(target - cur, -max_step_rad, max_step_rad)
-                cmd = cur + step
-                if not dry_run:
-                    client.command_joint_pos(cmd)
-
                 f = grab()
                 obs_buf.append(f)
                 save_obs(f)
@@ -250,6 +342,7 @@ def main(ckpt_path, server_host, server_port,
     except KeyboardInterrupt:
         print('\nStopping. Holding current pose.')
         try:
+            client.clear_waypoints()
             cur = client.get_joint_pos().result()
             client.command_joint_pos(cur)
         except Exception as e:

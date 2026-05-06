@@ -4,7 +4,7 @@ checkpoint:
   save_last_snapshot: false
   topk:
     format_str: epoch={epoch:04d}-train_loss={train_loss:.4f}.ckpt
-    k: 5
+    k: 100
     mode: min
     monitor_key: train_loss
 dataloader:
