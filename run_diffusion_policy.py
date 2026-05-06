@@ -27,11 +27,11 @@ python /home/cvlabusers/Appaji/diffusion_policy/scripts_pnp_lego/camera_server.p
 python /home/cvlabusers/Appaji/i2rt/examples/minimum_gello/minimum_gello.py --gripper linear_4310 --mode follower --can-channel can0 --bilateral_kp 0.2
 
 python run_diffusion_policy.py \
--i /proj/vondrick3/sruthi/Appaji/diffusion_policy/data/jgd/2026.05.05/17.36.50_train_diffusion_unet_hybrid_pnp_lego_image/checkpoints/epoch=0800-train_loss=0.0071.ckpt \
+-i /proj/vondrick3/sruthi/Appaji/diffusion_policy/data/jgd/2026.05.05/17.36.50_train_diffusion_unet_hybrid_pnp_lego_image/checkpoints/epoch=0600-train_loss=0.0072.ckpt \
 --frame-source remote \
 --frame-host 127.0.0.1 --frame-port 11335 \
 --server-host 127.0.0.1 --server-port 11333 \
---num-inference-steps 32 \
+--num-inference-steps 16 \
 --dry-run
 
 
