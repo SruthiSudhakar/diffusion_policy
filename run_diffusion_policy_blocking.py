@@ -31,6 +31,8 @@ sys.stderr = open(sys.stderr.fileno(), mode='w', buffering=1)
 
 import datetime
 import pathlib
+import shutil
+import subprocess
 import threading
 import time
 
@@ -99,28 +101,77 @@ def make_recording_wrapper(grab_fn, stop_fn, video_path, fps):
     grab_fn must return (3, 360, 640) float32 RGB in [0, 1]. The returned
     grab() is non-blocking — it returns the most recent cached frame.
     """
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    writer = cv2.VideoWriter(str(video_path), fourcc, float(fps), (640, 360))
-    if not writer.isOpened():
-        raise RuntimeError(f'cv2.VideoWriter failed to open {video_path}')
-    print(f'Recording rollout video to {video_path} @ {fps}Hz (640x360)')
+    width, height = 640, 360
 
-    state = {'frame': None}
+    # Pipe raw BGR frames to ffmpeg/libx264 if ffmpeg is on PATH. The OpenCV
+    # build in this env doesn't ship libx264, so cv2.VideoWriter falls back
+    # to mp4v which produces .mp4 files that some browsers/players refuse
+    # to decode. Going through ffmpeg gives a real H.264 + faststart mp4
+    # that plays everywhere. cv2 mp4v is kept only as a last-resort fallback.
+    ff_path = shutil.which('ffmpeg')
+    ff_proc = None
+    cv_writer = None
+    if ff_path is not None:
+        cmd = [
+            ff_path, '-y', '-loglevel', 'error',
+            '-f', 'rawvideo',
+            '-vcodec', 'rawvideo',
+            '-s', f'{width}x{height}',
+            '-pix_fmt', 'bgr24',
+            '-r', f'{float(fps)}',
+            '-i', '-',
+            '-c:v', 'libx264',
+            '-pix_fmt', 'yuv420p',
+            '-preset', 'fast',
+            '-crf', '23',
+            '-movflags', '+faststart',
+            str(video_path),
+        ]
+        ff_proc = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE,
+            bufsize=10**8,
+        )
+        print(f'Recording rollout video to {video_path} via ffmpeg/libx264 '
+              f'@ {fps}Hz ({width}x{height})')
+    else:
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        cv_writer = cv2.VideoWriter(str(video_path), fourcc, float(fps),
+                                    (width, height))
+        if not cv_writer.isOpened():
+            raise RuntimeError(f'cv2.VideoWriter failed to open {video_path}')
+        print(f'Recording rollout video to {video_path} via cv2.VideoWriter '
+              f'(mp4v fallback — install ffmpeg for H.264) @ {fps}Hz '
+              f'({width}x{height})')
+
+    state = {'frame': None, 'frames_written': 0}
     lock = threading.Lock()
     stop_evt = threading.Event()
 
     def _reader():
-        while not stop_evt.is_set():
-            try:
+        n = 0
+        try:
+            while not stop_evt.is_set():
                 f = grab_fn()
-            except Exception as e:
-                print(f'video reader: grab failed: {e}')
-                break
-            rgb = (f.transpose(1, 2, 0) * 255.0).clip(0, 255).astype(np.uint8)
-            bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-            writer.write(bgr)
-            with lock:
-                state['frame'] = f
+                rgb = (f.transpose(1, 2, 0) * 255.0).clip(0, 255).astype(np.uint8)
+                bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+                if not bgr.flags['C_CONTIGUOUS']:
+                    bgr = np.ascontiguousarray(bgr)
+                if ff_proc is not None:
+                    ff_proc.stdin.write(bgr.tobytes())
+                else:
+                    cv_writer.write(bgr)
+                n += 1
+                if n == 1:
+                    print(f'video reader: first frame written, '
+                          f'shape={bgr.shape}, dtype={bgr.dtype}, '
+                          f'min={bgr.min()}, max={bgr.max()}, mean={bgr.mean():.1f}')
+                with lock:
+                    state['frame'] = f
+                    state['frames_written'] = n
+        except BrokenPipeError as e:
+            print(f'video reader: ffmpeg pipe closed after {n} frames: {e!r}')
+        except Exception as e:
+            print(f'video reader: error after {n} frames: {e!r}')
 
     th = threading.Thread(target=_reader, daemon=True)
     th.start()
@@ -142,8 +193,31 @@ def make_recording_wrapper(grab_fn, stop_fn, video_path, fps):
 
     def stop():
         stop_evt.set()
-        th.join(timeout=2.0)
-        writer.release()
+        th.join(timeout=5.0)
+        if th.is_alive():
+            print('video reader: thread did not exit within 5s; '
+                  'finalizing writer anyway (last frames may be lost)')
+        with lock:
+            n = state['frames_written']
+        if ff_proc is not None:
+            try:
+                ff_proc.stdin.close()
+            except Exception as e:
+                print(f'ffmpeg stdin close failed: {e!r}')
+            try:
+                rc = ff_proc.wait(timeout=30.0)
+            except subprocess.TimeoutExpired:
+                ff_proc.kill()
+                rc = ff_proc.wait()
+                print('ffmpeg did not exit within 30s; killed')
+            err = ff_proc.stderr.read().decode('utf-8', errors='replace').strip()
+            if rc != 0:
+                print(f'ffmpeg exited with code {rc}. stderr:\n{err}')
+            elif err:
+                print(f'ffmpeg stderr (rc=0):\n{err}')
+        else:
+            cv_writer.release()
+        print(f'Video writer finalized: {n} frames written to {video_path}')
         stop_fn()
 
     return grab, stop
@@ -170,7 +244,7 @@ def make_recording_wrapper(grab_fn, stop_fn, video_path, fps):
               help='Number of actions to actually execute from each predicted '
                    'chunk of length n_action_steps (e.g. 16). 0 (default) means '
                    'execute the full chunk. Must be in [1, n_action_steps].')
-@click.option('--num-samples', default=50, type=int,
+@click.option('--num-samples', default=5, type=int,
               help='Number of action chunks to sample per observation. The same '
                    'obs is tiled along the batch dim and run through the policy '
                    'in a single forward pass; each sample uses an independent '
@@ -185,7 +259,7 @@ def make_recording_wrapper(grab_fn, stop_fn, video_path, fps):
               help='Per-joint L_inf speed cap (rad/s) for the i2rt interpolator.')
 @click.option('--start-pose-ramp-sec', default=2.0, type=float,
               help='Wall-clock duration for the smooth ramp to start_pose at boot.')
-@click.option('--settle-sec', default=0.23, type=float,
+@click.option('--settle-sec', default=0.5, type=float,
               help='Extra wait after the last waypoint\'s target time before '
                    'capturing the next observation. Lets the interpolator '
                    'finish settling at the final pose.')
@@ -206,12 +280,20 @@ def make_recording_wrapper(grab_fn, stop_fn, video_path, fps):
                    'the robot\'s actual position and the last scheduled action. '
                    'Use to tune --settle-sec / --max-joint-speed. Skipped under '
                    '--dry-run since no commands are sent.')
+@click.option('--max-steps', default=300, type=int,
+              help='Max total action waypoints scheduled to the robot before '
+                   'the loop auto-stops (each cycle schedules n_act_exec). '
+                   'Stop is also triggered by Ctrl+C. After either, the '
+                   'video is finalized and the user is prompted to label '
+                   'the rollout success/failure (used as a prefix on the '
+                   'run dir).')
 def main(ckpt_path, server_host, server_port,
          frame_source, frame_host, frame_port,
          frequency, rs_width, rs_height, rs_fps,
          device, num_inference_steps, n_act_exec, scheduler, num_samples,
          max_joint_speed, start_pose_ramp_sec, settle_sec,
-         dry_run, record, record_jpeg_quality, video_fps, log_settle_err):
+         dry_run, record, record_jpeg_quality, video_fps, log_settle_err,
+         max_steps):
     if num_samples < 1:
         raise click.BadParameter('--num-samples must be >= 1')
     if n_act_exec < 0:
@@ -385,8 +467,23 @@ def main(ckpt_path, server_host, server_port,
         client.clear_waypoints()
 
     cycle = 0
+    total_steps = 0
+    stop_reason = 'unknown'
     try:
         while True:
+            if total_steps >= max_steps:
+                print(f'\nReached max-steps={max_steps} (sent {total_steps} '
+                      f'action waypoints over {cycle} cycles). Stopping. '
+                      f'Holding current pose.')
+                if not dry_run:
+                    try:
+                        client.clear_waypoints()
+                        cur = client.get_joint_pos().result()
+                        client.command_joint_pos(cur)
+                    except Exception as e:
+                        print(f'Failed to hold pose: {e}')
+                stop_reason = 'max_steps'
+                break
             # ---- 5. Capture one fresh observation (most recent image + state) ----
             # If the policy expects n_obs > 1, tile the same most-recent obs to
             # match the expected shape (we do not maintain any history here).
@@ -470,6 +567,7 @@ def main(ckpt_path, server_host, server_port,
                 print(f'cycle {cycle}: settle err = {err:.4f} rad '
                       f'(max joint dist to last action)')
             cycle += 1
+            total_steps += len(actions)
     except KeyboardInterrupt:
         print('\nStopping. Holding current pose.')
         try:
@@ -478,8 +576,47 @@ def main(ckpt_path, server_host, server_port,
             client.command_joint_pos(cur)
         except Exception as e:
             print(f'Failed to hold pose: {e}')
+        stop_reason = 'keyboard_interrupt'
     finally:
         stop_camera()
+        print(f'Run finished after {total_steps} action waypoints over '
+              f'{cycle} cycles (stop_reason={stop_reason}).')
+        final_dir = record_dir
+        if record_dir is not None:
+            label = None
+            while label is None:
+                try:
+                    ans = input('Label this rollout — [s]uccess or [f]ailure? ').strip().lower()
+                except EOFError:
+                    print('No input available; leaving run dir unlabeled.')
+                    break
+                if ans in ('s', 'success'):
+                    label = 'success'
+                elif ans in ('f', 'failure', 'fail'):
+                    label = 'failure'
+                else:
+                    print("  Please type 's' (success) or 'f' (failure).")
+            if label is not None:
+                new_dir = record_dir.parent / f'{label}_{record_dir.name}'
+                try:
+                    record_dir.rename(new_dir)
+                    final_dir = new_dir
+                    print(f'Renamed run dir -> {new_dir}')
+                except Exception as e:
+                    print(f'Failed to rename {record_dir} -> {new_dir}: {e}')
+
+        if final_dir is not None:
+            viz_script = pathlib.Path(__file__).resolve().parent / 'visualize_run_stats.py'
+            print(f'Running {viz_script.name} on {final_dir}')
+            try:
+                subprocess.run(
+                    [sys.executable, str(viz_script), str(final_dir)],
+                    check=True,
+                )
+            except subprocess.CalledProcessError as e:
+                print(f'visualize_run_stats.py failed (exit {e.returncode})')
+            except Exception as e:
+                print(f'Failed to launch visualize_run_stats.py: {e!r}')
 
 
 if __name__ == '__main__':

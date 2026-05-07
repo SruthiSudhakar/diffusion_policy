@@ -7,7 +7,7 @@ Each row of the output figure = one cycle:
 
 Run:
     python visualize_run_stats.py <run_dir>
-        [--out <png_path>]   # default: <run_dir>/stats.png
+        [--out <png_path>]   # default: <run_dir>/sample_variance.png
 """
 import pathlib
 import sys
@@ -23,19 +23,22 @@ JOINT_LABELS = ['j0', 'j1', 'j2', 'j3', 'j4', 'j5', 'gripper']
 @click.command()
 @click.argument('run_dir', type=click.Path(exists=True, file_okay=False))
 @click.option('--out', 'out_path', type=click.Path(), default=None,
-              help='Output PNG path (default: <run_dir>/stats.png).')
+              help='Output PNG path (default: <run_dir>/sample_variance.png).')
 def main(run_dir, out_path):
     run_dir = pathlib.Path(run_dir)
     action_files = sorted(run_dir.glob('actions_*.npy'))
     if not action_files:
         sys.exit(f'no actions_*.npy under {run_dir}')
 
+    obs_dir = run_dir / 'observations'
+    frame_dir = obs_dir if obs_dir.is_dir() else run_dir
+
     cycles = []
     for af in action_files:
         idx = int(af.stem.split('_')[1])
-        ff = run_dir / f'frame_{idx:06d}.jpg'
+        ff = frame_dir / f'frame_{idx:06d}.jpg'
         if not ff.exists():
-            print(f'skip cycle {idx}: missing {ff.name}')
+            print(f'skip cycle {idx}: missing {ff}')
             continue
         actions = np.load(af)        # (N, n_act, 7)
         cycles.append((idx, ff, actions))
@@ -86,7 +89,7 @@ def main(run_dir, out_path):
             ax_std.legend(loc='upper left', fontsize=7, ncol=2)
 
     fig.tight_layout()
-    out_path = pathlib.Path(out_path) if out_path else (run_dir / 'stats.png')
+    out_path = pathlib.Path(out_path) if out_path else (run_dir / 'sample_variance.png')
     fig.savefig(out_path, dpi=120, bbox_inches='tight')
     print(f'wrote {out_path}  ({n_cycles} cycles, n_act={n_act}, n_dof={n_dof}, '
           f'shared y_top={y_top:.4f})')
