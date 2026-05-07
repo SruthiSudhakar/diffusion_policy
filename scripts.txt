@@ -18,6 +18,7 @@ python scripts_pnp_lego/convert_pnp_to_zarr.py \
 
 
 2. Training:
+With Image+State:
 cd /proj/vondrick3/sruthi/Appaji/diffusion_policy
 conda activate jgdrobodiff
 cv14
@@ -40,6 +41,15 @@ task.dataset_path=data/pnp_red_lego_to_brown_bowl/replay_1_200_with_state_15hz.z
 task.dataset.zarr_path=data/pnp_red_lego_to_brown_bowl/replay_1_200_with_state_15hz.zarr \
 'hydra.run.dir=data/jgd/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}'
 
+With Just Image:
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 OMP_NUM_THREADS=4 TOKENIZERS_PARALLELISM=false \
+accelerate launch --config_file accelerate_config.yaml --num_processes 8 \
+train.py --config-dir=. \
+--config-name=pnp_lego_image_only_diffusion_policy_cnn.yaml \
+training.seed=42 \
+task.dataset_path=data/pnp_red_lego_to_brown_bowl/replay_201_300_with_state.zarr \
+task.dataset.zarr_path=data/pnp_red_lego_to_brown_bowl/replay_201_300_with_state.zarr \
+'hydra.run.dir=data/jgd/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}'
 
 
 3.Differences Notes:

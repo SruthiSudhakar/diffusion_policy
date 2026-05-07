@@ -20,10 +20,12 @@ class PnPLegoImageDataset(BaseImageDataset):
             seed=42,
             val_ratio=0.0,
             max_train_episodes=None,
+            use_state=True,
             ):
         super().__init__()
+        keys = ['image', 'state', 'action'] if use_state else ['image', 'action']
         self.replay_buffer = ReplayBuffer.copy_from_path(
-            zarr_path, keys=['image', 'state', 'action'])
+            zarr_path, keys=keys)
         val_mask = get_val_mask(
             n_episodes=self.replay_buffer.n_episodes,
             val_ratio=val_ratio,
@@ -44,6 +46,7 @@ class PnPLegoImageDataset(BaseImageDataset):
         self.horizon = horizon
         self.pad_before = pad_before
         self.pad_after = pad_after
+        self.use_state = use_state
 
     def get_validation_dataset(self):
         val_set = copy.copy(self)
@@ -60,8 +63,9 @@ class PnPLegoImageDataset(BaseImageDataset):
     def get_normalizer(self, mode='limits', **kwargs):
         data = {
             'action': self.replay_buffer['action'],
-            'state': self.replay_buffer['state'],
         }
+        if self.use_state:
+            data['state'] = self.replay_buffer['state']
         normalizer = LinearNormalizer()
         normalizer.fit(data=data, last_n_dims=1, mode=mode, **kwargs)
         normalizer['image'] = get_image_range_normalizer()
@@ -72,13 +76,14 @@ class PnPLegoImageDataset(BaseImageDataset):
 
     def _sample_to_data(self, sample):
         image = np.moveaxis(sample['image'], -1, 1).astype(np.float32) / 255.0
-        state = sample['state'].astype(np.float32)
         action = sample['action'].astype(np.float32)
+        obs = {
+            'image': image,  # T, 3, H, W
+        }
+        if self.use_state:
+            obs['state'] = sample['state'].astype(np.float32)  # T, 7
         return {
-            'obs': {
-                'image': image,  # T, 3, H, W
-                'state': state,  # T, 7
-            },
+            'obs': obs,
             'action': action,    # T, 7
         }
 
