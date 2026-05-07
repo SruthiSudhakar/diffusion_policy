@@ -17,6 +17,7 @@ Run with the jgdrobodiff env:
 """
 import argparse
 import os
+import re
 import sys
 import pathlib
 import numpy as np
@@ -48,13 +49,17 @@ def main():
         default=str(REPO_ROOT / 'data' / 'pnp_red_lego_to_brown_bowl' / 'replay.zarr'))
     parser.add_argument('--image-size', type=int, nargs=2, default=[640, 360],
         help='target (W, H) for resized RGB frames')
-    parser.add_argument('--subsample', type=int, default=3,
-        help='take every Nth frame (30 Hz / 3 = 10 Hz)')
+    parser.add_argument('--subsample', type=int, default=2,
+        help='take every Nth frame (30 Hz / 2 = 15 Hz)')
     parser.add_argument('--success-only', action='store_true', default=True)
     parser.add_argument('--include-failures', dest='success_only',
         action='store_false')
     parser.add_argument('--max-episodes', type=int, default=None,
         help='for smoke-testing: only convert this many episodes')
+    parser.add_argument('--episode-min', type=int, default=None,
+        help='inclusive lower bound on episode number (e.g. 1 to start at success_1)')
+    parser.add_argument('--episode-max', type=int, default=None,
+        help='inclusive upper bound on episode number (e.g. 200 to stop at success_200)')
     args = parser.parse_args()
 
     src = pathlib.Path(args.src)
@@ -67,7 +72,20 @@ def main():
     dst.parent.mkdir(parents=True, exist_ok=True)
 
     prefix = 'success_' if args.success_only else ''
-    all_npy = sorted(p for p in src.glob(f'{prefix}*.npy'))
+    ep_re = re.compile(rf'^{prefix}(\d+)_') if prefix else re.compile(r'^(\d+)_')
+
+    def ep_num(p):
+        m = ep_re.match(p.name)
+        return int(m.group(1)) if m else None
+
+    all_npy = sorted(
+        (p for p in src.glob(f'{prefix}*.npy') if ep_num(p) is not None),
+        key=ep_num,
+    )
+    if args.episode_min is not None or args.episode_max is not None:
+        lo = args.episode_min if args.episode_min is not None else -10**9
+        hi = args.episode_max if args.episode_max is not None else 10**9
+        all_npy = [p for p in all_npy if lo <= ep_num(p) <= hi]
     npy_files = []
     skipped = []
     for p in all_npy:
@@ -80,7 +98,8 @@ def main():
         print(f'skipping {len(skipped)} episodes with no frames dir: {skipped}')
     if args.max_episodes is not None:
         npy_files = npy_files[:args.max_episodes]
-    print(f'found {len(npy_files)} episodes (success_only={args.success_only})')
+    print(f'found {len(npy_files)} episodes (success_only={args.success_only}, '
+          f'episode range=[{args.episode_min}, {args.episode_max}])')
 
     import zarr
     store = zarr.DirectoryStore(str(dst))
@@ -97,6 +116,7 @@ def main():
 
         idx = np.arange(0, T, args.subsample)
         traj_sub = traj[idx].astype(np.float32)
+        state_sub = traj_sub.copy()
 
         images = np.empty((len(idx), target_h, target_w, 3), dtype=np.uint8)
         for k, t in enumerate(idx):
@@ -106,7 +126,7 @@ def main():
                 images[k] = np.asarray(im, dtype=np.uint8)
 
         buffer.add_episode(
-            data={'image': images, 'action': traj_sub},
+            data={'image': images, 'state': state_sub, 'action': traj_sub},
             chunks={'image': img_chunks},
         )
 

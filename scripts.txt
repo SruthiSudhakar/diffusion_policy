@@ -4,24 +4,43 @@ python scripts_pnp_lego/convert_pnp_to_zarr.py \
 --dst data/pnp_red_lego_to_brown_bowl/replay_200ex.zarr \
 --image-size 640 360 --subsample 3 --success-only
 
+python scripts_pnp_lego/convert_pnp_to_zarr.py \
+--src /proj/vondrick3/datasets/VLMjgd/PnPRedLegoToBrownBowl \
+--dst data/pnp_red_lego_to_brown_bowl/replay_1_200_with_state_15hz.zarr \
+--image-size 640 360 --success-only \
+--episode-min 1 --episode-max 200
+
+python scripts_pnp_lego/convert_pnp_to_zarr.py \
+--src /proj/vondrick3/datasets/VLMjgd/PnPRedLegoToBrownBowl \
+--dst data/pnp_red_lego_to_brown_bowl/replay_201_300_with_state.zarr \
+--image-size 640 360 --success-only \
+--episode-min 201 --episode-max 300
+
+
 2. Training:
 cd /proj/vondrick3/sruthi/Appaji/diffusion_policy
 conda activate jgdrobodiff
-
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,6,7 OMP_NUM_THREADS=4 TOKENIZERS_PARALLELISM=false \
+cv14
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 OMP_NUM_THREADS=4 TOKENIZERS_PARALLELISM=false \
 accelerate launch --config_file accelerate_config.yaml --num_processes 8 \
 train.py --config-dir=. \
 --config-name=pnp_lego_image_diffusion_policy_cnn.yaml \
 training.seed=42 \
+task.dataset_path=data/pnp_red_lego_to_brown_bowl/replay_201_300_with_state.zarr \
+task.dataset.zarr_path=data/pnp_red_lego_to_brown_bowl/replay_201_300_with_state.zarr \
 'hydra.run.dir=data/jgd/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}'
 
-Resume training:
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,6,7 OMP_NUM_THREADS=4 TOKENIZERS_PARALLELISM=false \
-accelerate launch --config_file accelerate_config.yaml --num_processes 7 \
+cv12
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 OMP_NUM_THREADS=4 TOKENIZERS_PARALLELISM=false \
+accelerate launch --config_file accelerate_config.yaml --num_processes 8 \
 train.py --config-dir=. \
 --config-name=pnp_lego_image_diffusion_policy_cnn.yaml \
 training.seed=42 \
-hydra.run.dir=data/jgd/2026.05.05/17.36.50_train_diffusion_unet_hybrid_pnp_lego_image
+task.dataset_path=data/pnp_red_lego_to_brown_bowl/replay_1_200_with_state_15hz.zarr \
+task.dataset.zarr_path=data/pnp_red_lego_to_brown_bowl/replay_1_200_with_state_15hz.zarr \
+'hydra.run.dir=data/jgd/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}'
+
+
 
 3.Differences Notes:
 1. image augmentations - random crop 336x600

@@ -13,7 +13,7 @@ dataloader:
   persistent_workers: true
   pin_memory: false
   shuffle: true
-dataset_obs_steps: 2
+dataset_obs_steps: 1
 ema:
   _target_: diffusion_policy.model.diffusion.ema_model.EMAModel
   inv_gamma: 1.0
@@ -30,7 +30,7 @@ logging:
   mode: online
   name: pnp_lego_image_diffusion_policy_cnn
   project: diffusion_policy_pnp_lego
-  resume: true
+  resume: false
   tags:
   - train_diffusion_unet_hybrid
   - pnp_lego_image
@@ -40,7 +40,7 @@ multi_run:
   wandb_name_base: pnp_lego_image_diffusion_policy_cnn
 n_action_steps: 16
 n_latency_steps: 0
-n_obs_steps: 2
+n_obs_steps: 1
 name: train_diffusion_unet_hybrid
 obs_as_global_cond: true
 optimizer:
@@ -68,7 +68,7 @@ policy:
   kernel_size: 5
   n_action_steps: 16
   n_groups: 8
-  n_obs_steps: 2
+  n_obs_steps: 1
   noise_scheduler:
     _target_: diffusers.schedulers.scheduling_ddpm.DDPMScheduler
     beta_end: 0.02
@@ -92,6 +92,10 @@ policy:
         - 360
         - 640
         type: rgb
+      state:
+        shape:
+        - 7
+        type: low_dim
 shape_meta:
   action:
     shape:
@@ -103,13 +107,17 @@ shape_meta:
       - 360
       - 640
       type: rgb
+    state:
+      shape:
+      - 7
+      type: low_dim
 task:
   name: pnp_lego_image
   image_shape:
   - 3
   - 360
   - 640
-  dataset_path: data/pnp_red_lego_to_brown_bowl/replay.zarr
+  dataset_path: data/pnp_red_lego_to_brown_bowl/replay_200ex_with_state_15hz.zarr
   shape_meta:
     action:
       shape:
@@ -121,13 +129,17 @@ task:
         - 360
         - 640
         type: rgb
+      state:
+        shape:
+        - 7
+        type: low_dim
   env_runner:
     _target_: diffusion_policy.env_runner.real_pusht_image_runner.RealPushTImageRunner
   dataset:
     _target_: diffusion_policy.dataset.pnp_lego_image_dataset.PnPLegoImageDataset
-    zarr_path: data/pnp_red_lego_to_brown_bowl/replay.zarr
+    zarr_path: data/pnp_red_lego_to_brown_bowl/replay_200ex_with_state_15hz.zarr
     horizon: 32
-    pad_before: 1
+    pad_before: 0
     pad_after: 15
     seed: 42
     val_ratio: 0.05
@@ -143,7 +155,7 @@ training:
   max_train_steps: null
   max_val_steps: null
   num_epochs: 3050
-  resume: true
+  resume: false
   rollout_every: 50
   sample_every: 5
   seed: 42

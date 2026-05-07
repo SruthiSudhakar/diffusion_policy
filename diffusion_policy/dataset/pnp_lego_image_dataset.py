@@ -23,7 +23,7 @@ class PnPLegoImageDataset(BaseImageDataset):
             ):
         super().__init__()
         self.replay_buffer = ReplayBuffer.copy_from_path(
-            zarr_path, keys=['image', 'action'])
+            zarr_path, keys=['image', 'state', 'action'])
         val_mask = get_val_mask(
             n_episodes=self.replay_buffer.n_episodes,
             val_ratio=val_ratio,
@@ -60,6 +60,7 @@ class PnPLegoImageDataset(BaseImageDataset):
     def get_normalizer(self, mode='limits', **kwargs):
         data = {
             'action': self.replay_buffer['action'],
+            'state': self.replay_buffer['state'],
         }
         normalizer = LinearNormalizer()
         normalizer.fit(data=data, last_n_dims=1, mode=mode, **kwargs)
@@ -71,10 +72,12 @@ class PnPLegoImageDataset(BaseImageDataset):
 
     def _sample_to_data(self, sample):
         image = np.moveaxis(sample['image'], -1, 1).astype(np.float32) / 255.0
+        state = sample['state'].astype(np.float32)
         action = sample['action'].astype(np.float32)
         return {
             'obs': {
                 'image': image,  # T, 3, H, W
+                'state': state,  # T, 7
             },
             'action': action,    # T, 7
         }

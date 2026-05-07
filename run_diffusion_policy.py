@@ -113,8 +113,8 @@ def make_remote_grab(frame_host, frame_port):
               help='local = open RealSense via pyrealsense2; remote = pull JPEGs from camera_server.py')
 @click.option('--frame-host', default='127.0.0.1', help='Camera server host (--frame-source remote)')
 @click.option('--frame-port', default=11335, type=int, help='Camera server port (--frame-source remote)')
-@click.option('--frequency', default=10.0, type=float,
-              help='Control rate in Hz. Must match training (10).')
+@click.option('--frequency', default=15.0, type=float,
+              help='Control rate in Hz. Must match training (15).')
 @click.option('--steps-per-inference', default=16, type=int,
               help='Open-loop actions executed before re-planning. '
                    'Defaults to n_action_steps from training.')
@@ -124,7 +124,7 @@ def make_remote_grab(frame_host, frame_port):
 @click.option('--device', default='auto', help="'auto' picks cuda:0 if available else cpu.")
 @click.option('--num-inference-steps', default=16, type=int,
               help='Diffusion sampling steps. Training default (100, DDPM) is too slow '
-                   'for real-time 10 Hz; eval_real_robot.py uses 16 (DDIM-style).')
+                   'for real-time 15 Hz; eval_real_robot.py uses 16 (DDIM-style).')
 @click.option('--scheduler', type=click.Choice(['keep', 'ddpm', 'ddim']),
               default='ddim',
               help="Inference scheduler. 'ddim' (default) rebuilds a DDIM "
@@ -164,7 +164,7 @@ def main(ckpt_path, server_host, server_port,
     if device_t.type == 'cpu':
         print('WARNING: running on CPU. Each inference call samples 100 DDPM steps '
               'over a 250M-param UNet — expect many seconds per chunk, so real-time '
-              '10 Hz control will not be possible.')
+              '15 Hz control will not be possible.')
     policy.to(device_t).eval()
     if hasattr(policy, 'num_inference_steps'):
         old_steps = policy.num_inference_steps
@@ -271,12 +271,15 @@ def main(ckpt_path, server_host, server_port,
 
     dt = 1.0 / frequency
 
-    # 4. Warm up obs buffer
+    # 4. Warm up obs buffer (image + 7-DOF joint state)
     print(f'Warming up {n_obs}-frame observation buffer...')
-    obs_buf = deque(maxlen=n_obs)
+    img_buf = deque(maxlen=n_obs)
+    state_buf = deque(maxlen=n_obs)
     for _ in range(n_obs):
         f = grab()
-        obs_buf.append(f)
+        q = client.get_joint_pos().result().astype(np.float32)
+        img_buf.append(f)
+        state_buf.append(q)
         save_obs(f)
         time.sleep(dt)
 
@@ -294,11 +297,15 @@ def main(ckpt_path, server_host, server_port,
     try:
         while True:
             # ---- 5. Inference at `frequency` Hz ----
-            obs_np = np.stack(list(obs_buf), axis=0)[None, ...]  # (1, n_obs, 3, 360, 640)
+            obs_img_np = np.stack(list(img_buf), axis=0)[None, ...]      # (1, n_obs, 3, 360, 640)
+            obs_state_np = np.stack(list(state_buf), axis=0)[None, ...]  # (1, n_obs, 7)
             obs_anchor_time = time.time()
             with torch.no_grad():
-                obs_t = torch.from_numpy(obs_np).to(device_t)
-                pred = policy.predict_action({'image': obs_t})
+                obs_t = {
+                    'image': torch.from_numpy(obs_img_np).to(device_t),
+                    'state': torch.from_numpy(obs_state_np).to(device_t),
+                }
+                pred = policy.predict_action(obs_t)
             actions = pred['action'][0].cpu().numpy()  # (n_act, 7)
             inference_latency = time.time() - obs_anchor_time
 
@@ -334,7 +341,9 @@ def main(ckpt_path, server_host, server_port,
             while time.time() < next_inference_t - dt * 0.5:
                 tick = time.time()
                 f = grab()
-                obs_buf.append(f)
+                q = client.get_joint_pos().result().astype(np.float32)
+                img_buf.append(f)
+                state_buf.append(q)
                 save_obs(f)
                 rem = dt - (time.time() - tick)
                 if rem > 0:
