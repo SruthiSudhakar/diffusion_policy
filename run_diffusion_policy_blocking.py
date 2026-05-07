@@ -108,6 +108,12 @@ def make_remote_grab(frame_host, frame_port):
 @click.option('--device', default='auto', help="'auto' picks cuda:0 if available else cpu.")
 @click.option('--num-inference-steps', default=16, type=int,
               help='Diffusion sampling steps.')
+@click.option('--num-samples', default=50, type=int,
+              help='Number of action chunks to sample per observation. The same '
+                   'obs is tiled along the batch dim and run through the policy '
+                   'in a single forward pass; each sample uses an independent '
+                   'noise init so the chunks differ. Sample 0 drives the robot; '
+                   'all samples are saved when --record is set.')
 @click.option('--scheduler', type=click.Choice(['keep', 'ddpm', 'ddim']),
               default='ddim',
               help="Inference scheduler. 'ddim' (default) rebuilds a DDIM "
@@ -117,7 +123,7 @@ def make_remote_grab(frame_host, frame_port):
               help='Per-joint L_inf speed cap (rad/s) for the i2rt interpolator.')
 @click.option('--start-pose-ramp-sec', default=2.0, type=float,
               help='Wall-clock duration for the smooth ramp to start_pose at boot.')
-@click.option('--settle-sec', default=0.15, type=float,
+@click.option('--settle-sec', default=0.23, type=float,
               help='Extra wait after the last waypoint\'s target time before '
                    'capturing the next observation. Lets the interpolator '
                    'finish settling at the final pose.')
@@ -126,12 +132,19 @@ def make_remote_grab(frame_host, frame_port):
 @click.option('--record/--no-record', default=True,
               help='Save each policy-input image (640x360 RGB JPEG) to disk.')
 @click.option('--record-jpeg-quality', default=95, type=int)
+@click.option('--log-settle-err/--no-log-settle-err', default=True,
+              help='After each chunk, log the max per-joint distance between '
+                   'the robot\'s actual position and the last scheduled action. '
+                   'Use to tune --settle-sec / --max-joint-speed. Skipped under '
+                   '--dry-run since no commands are sent.')
 def main(ckpt_path, server_host, server_port,
          frame_source, frame_host, frame_port,
          frequency, rs_width, rs_height, rs_fps,
-         device, num_inference_steps, scheduler,
+         device, num_inference_steps, scheduler, num_samples,
          max_joint_speed, start_pose_ramp_sec, settle_sec,
-         dry_run, record, record_jpeg_quality):
+         dry_run, record, record_jpeg_quality, log_settle_err):
+    if num_samples < 1:
+        raise click.BadParameter('--num-samples must be >= 1')
     # 1. Load checkpoint
     print(f'Loading checkpoint: {ckpt_path}')
     payload = torch.load(open(ckpt_path, 'rb'), pickle_module=dill, map_location='cpu')
@@ -184,9 +197,20 @@ def main(ckpt_path, server_host, server_port,
         print(f'Swapped scheduler: {type(old_sched).__name__} -> '
               f'{type(new_sched).__name__}')
     n_obs = policy.n_obs_steps
-    assert n_obs==1
+    # assert n_obs==1
     n_act = policy.n_action_steps
     print(f'Policy ready: n_obs_steps={n_obs}, n_action_steps={n_act}, action_dim={policy.action_dim}')
+
+    # Determine which observation keys this checkpoint actually expects.
+    # Some checkpoints are image-only; others use image + state. We trust the
+    # normalizer's registered keys since the obs encoder and normalizer are
+    # both built from the same shape_meta at training time.
+    obs_keys = list(policy.normalizer.params_dict.keys())
+    if 'image' not in obs_keys:
+        raise RuntimeError(
+            f'Policy normalizer has no "image" key. Found: {obs_keys}')
+    use_state = 'state' in obs_keys
+    print(f'Policy obs keys: {obs_keys} (use_state={use_state})')
 
     dt = 1.0 / frequency
 
@@ -246,21 +270,30 @@ def main(ckpt_path, server_host, server_port,
         frame_idx += 1
 
     # 4. Policy warm-up — burn JIT/CUDA-init cost on a dummy obs.
-    print('Warming up policy inference')
+    # Use the same batch size as the real loop so the warm-up covers the
+    # CUDA allocator state we will hit during inference.
+    print(f'Warming up policy inference (batch={num_samples})')
     f_warm = grab()
     q_warm = client.get_joint_pos().result().astype(np.float32)
     with torch.no_grad():
         if hasattr(policy, 'reset'):
             policy.reset()
-        img_warm = np.stack([f_warm] * n_obs, axis=0)[None, ...]
-        st_warm = np.stack([q_warm] * n_obs, axis=0)[None, ...]
-        _ = policy.predict_action({
-            'image': torch.from_numpy(img_warm).to(device_t),
-            'state': torch.from_numpy(st_warm).to(device_t),
-        })
+        img_warm = np.broadcast_to(
+            np.stack([f_warm] * n_obs, axis=0)[None, ...],
+            (num_samples, n_obs, *f_warm.shape),
+        ).copy()
+        warm_obs = {'image': torch.from_numpy(img_warm).to(device_t)}
+        if use_state:
+            st_warm = np.broadcast_to(
+                np.stack([q_warm] * n_obs, axis=0)[None, ...],
+                (num_samples, n_obs, q_warm.shape[0]),
+            ).copy()
+            warm_obs['state'] = torch.from_numpy(st_warm).to(device_t)
+        _ = policy.predict_action(warm_obs)
 
     print(f'Starting blocking policy loop. n_obs={n_obs}, n_act={n_act}, '
-          f'dt={dt:.4f}s, chunk duration={n_act * dt:.2f}s. '
+          f'num_samples={num_samples}, dt={dt:.4f}s, '
+          f'chunk duration={n_act * dt:.2f}s. '
           f'Ctrl+C to stop and hold pose.{" (DRY RUN — no commands sent)" if dry_run else ""}')
 
     # Ensure no leftover waypoints from the start-pose ramp.
@@ -273,22 +306,59 @@ def main(ckpt_path, server_host, server_port,
             # ---- 5. Capture one fresh observation (most recent image + state) ----
             # If the policy expects n_obs > 1, tile the same most-recent obs to
             # match the expected shape (we do not maintain any history here).
+            # We then tile the obs along the batch dim by num_samples so a
+            # single forward pass produces num_samples independent action
+            # chunks (each draws its own noise init in conditional_sample).
             f = grab()
-            q = client.get_joint_pos().result().astype(np.float32)
             save_obs(f)
-            obs_img_np = np.stack([f] * n_obs, axis=0)[None, ...]      # (1, n_obs, 3, 360, 640)
-            obs_state_np = np.stack([q] * n_obs, axis=0)[None, ...]    # (1, n_obs, 7)
+            obs_img_one = np.stack([f] * n_obs, axis=0)[None, ...]      # (1, n_obs, 3, 360, 640)
+            obs_img_np = np.broadcast_to(
+                obs_img_one,
+                (num_samples, *obs_img_one.shape[1:]),
+            ).copy()                                                     # (N, n_obs, 3, 360, 640)
+            if use_state:
+                q = client.get_joint_pos().result().astype(np.float32)
+                obs_state_one = np.stack([q] * n_obs, axis=0)[None, ...]  # (1, n_obs, 7)
+                obs_state_np = np.broadcast_to(
+                    obs_state_one,
+                    (num_samples, *obs_state_one.shape[1:]),
+                ).copy()                                                  # (N, n_obs, 7)
 
-            # ---- 6. Inference ----
+            # ---- 6. Inference (batched: one forward pass -> N samples) ----
             t_inf_start = time.time()
             with torch.no_grad():
                 obs_t = {
                     'image': torch.from_numpy(obs_img_np).to(device_t),
-                    'state': torch.from_numpy(obs_state_np).to(device_t),
                 }
+                if use_state:
+                    obs_t['state'] = torch.from_numpy(obs_state_np).to(device_t)
                 pred = policy.predict_action(obs_t)
-            actions = pred['action'][0].cpu().numpy()  # (n_act, 7)
+            actions_all = pred['action'].cpu().numpy()  # (N, n_act, 7)
+            actions = actions_all[0]                    # send sample 0 to robot
             inference_latency = time.time() - t_inf_start
+
+            # Persist the full (N, n_act, 7) tensor for offline analysis.
+            if record_dir is not None:
+                np.save(record_dir / f'actions_{cycle:06d}.npy', actions_all)
+
+            # Per-DOF stats across the N samples. mean/min/max collapse over
+            # both samples and time (chunk envelope per joint). std is
+            # reported per-timestep so we can see how sample disagreement
+            # evolves through the chunk (typically small near t=0 where the
+            # chunk is conditioned on the obs, larger near t=n_act-1).
+            sample_std = actions_all.std(axis=0)                    # (n_act, 7)
+            stat_mean = actions_all.mean(axis=(0, 1))               # (7,)
+            stat_min = actions_all.min(axis=(0, 1))                 # (7,)
+            stat_max = actions_all.max(axis=(0, 1))                 # (7,)
+            fmt = lambda v: '[' + ' '.join(f'{x:+.4f}' for x in v) + ']'
+            print(f'cycle {cycle}: stats over {num_samples} samples (per-DOF):')
+            print(f'  mean = {fmt(stat_mean)}')
+            print(f'  min  = {fmt(stat_min)}')
+            print(f'  max  = {fmt(stat_max)}')
+            print(f'  std across {num_samples} samples, shape '
+                  f'(n_act={sample_std.shape[0]}, 7):')
+            for t in range(sample_std.shape[0]):
+                print(f'    t={t:2d}: {fmt(sample_std[t])}')
 
             # ---- 7. Schedule the entire chunk back-to-back, starting now ----
             schedule_anchor = time.time()
@@ -302,13 +372,20 @@ def main(ckpt_path, server_host, server_port,
             chunk_dur = action_ts[-1] - schedule_anchor
             print(f'cycle {cycle}: inference={inference_latency*1000:.0f}ms, '
                   f'submitted {len(actions)} waypoints over {chunk_dur:.2f}s')
-            cycle += 1
 
             # ---- 8. Wait for the chunk to finish (+ settle) before next obs ----
             sleep_until = action_ts[-1] + settle_sec
             remaining = sleep_until - time.time()
             if remaining > 0:
                 time.sleep(remaining)
+
+            # ---- 9. Settle diagnostic ----
+            if log_settle_err and not dry_run:
+                pos_now = client.get_joint_pos().result()
+                err = float(np.max(np.abs(pos_now - actions[-1])))
+                print(f'cycle {cycle}: settle err = {err:.4f} rad '
+                      f'(max joint dist to last action)')
+            cycle += 1
     except KeyboardInterrupt:
         print('\nStopping. Holding current pose.')
         try:
