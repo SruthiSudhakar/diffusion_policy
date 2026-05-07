@@ -31,6 +31,7 @@ sys.stderr = open(sys.stderr.fileno(), mode='w', buffering=1)
 
 import datetime
 import pathlib
+import threading
 import time
 
 import click
@@ -91,6 +92,63 @@ def make_remote_grab(frame_host, frame_port):
     return grab, stop
 
 
+def make_recording_wrapper(grab_fn, stop_fn, video_path, fps):
+    """Pull frames continuously in a background thread; write each to an mp4
+    at `fps` and cache the latest one for the main loop to read as an obs.
+
+    grab_fn must return (3, 360, 640) float32 RGB in [0, 1]. The returned
+    grab() is non-blocking — it returns the most recent cached frame.
+    """
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    writer = cv2.VideoWriter(str(video_path), fourcc, float(fps), (640, 360))
+    if not writer.isOpened():
+        raise RuntimeError(f'cv2.VideoWriter failed to open {video_path}')
+    print(f'Recording rollout video to {video_path} @ {fps}Hz (640x360)')
+
+    state = {'frame': None}
+    lock = threading.Lock()
+    stop_evt = threading.Event()
+
+    def _reader():
+        while not stop_evt.is_set():
+            try:
+                f = grab_fn()
+            except Exception as e:
+                print(f'video reader: grab failed: {e}')
+                break
+            rgb = (f.transpose(1, 2, 0) * 255.0).clip(0, 255).astype(np.uint8)
+            bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+            writer.write(bgr)
+            with lock:
+                state['frame'] = f
+
+    th = threading.Thread(target=_reader, daemon=True)
+    th.start()
+
+    t0 = time.time()
+    while True:
+        with lock:
+            ready = state['frame'] is not None
+        if ready:
+            break
+        if time.time() - t0 > 5.0:
+            stop_evt.set()
+            raise RuntimeError('No frames received within 5s of starting recorder')
+        time.sleep(0.01)
+
+    def grab():
+        with lock:
+            return state['frame'].copy()
+
+    def stop():
+        stop_evt.set()
+        th.join(timeout=2.0)
+        writer.release()
+        stop_fn()
+
+    return grab, stop
+
+
 @click.command()
 @click.option('-i', '--input', 'ckpt_path', required=True, help='Path to .ckpt file')
 @click.option('--server-host', default='127.0.0.1', help='Follower portal host')
@@ -108,6 +166,10 @@ def make_remote_grab(frame_host, frame_port):
 @click.option('--device', default='auto', help="'auto' picks cuda:0 if available else cpu.")
 @click.option('--num-inference-steps', default=16, type=int,
               help='Diffusion sampling steps.')
+@click.option('--n-act-exec', default=0, type=int,
+              help='Number of actions to actually execute from each predicted '
+                   'chunk of length n_action_steps (e.g. 16). 0 (default) means '
+                   'execute the full chunk. Must be in [1, n_action_steps].')
 @click.option('--num-samples', default=50, type=int,
               help='Number of action chunks to sample per observation. The same '
                    'obs is tiled along the batch dim and run through the policy '
@@ -130,8 +192,15 @@ def make_remote_grab(frame_host, frame_port):
 @click.option('--dry-run', is_flag=True, default=False,
               help='Run inference but do not send commands to the robot.')
 @click.option('--record/--no-record', default=True,
-              help='Save each policy-input image (640x360 RGB JPEG) to disk.')
+              help='Save observations (640x360 JPEG per cycle) into an '
+                   '"observations/" subfolder, plus a continuous rollout '
+                   'video ("rollout.mp4") and per-cycle action tensors.')
 @click.option('--record-jpeg-quality', default=95, type=int)
+@click.option('--video-fps', default=30.0, type=float,
+              help='Framerate written into the rollout.mp4 header. The '
+                   'background recorder writes one frame per call to the '
+                   'underlying camera grab, so this should match the camera '
+                   'frame rate (default 30, matching --rs-fps).')
 @click.option('--log-settle-err/--no-log-settle-err', default=True,
               help='After each chunk, log the max per-joint distance between '
                    'the robot\'s actual position and the last scheduled action. '
@@ -140,11 +209,13 @@ def make_remote_grab(frame_host, frame_port):
 def main(ckpt_path, server_host, server_port,
          frame_source, frame_host, frame_port,
          frequency, rs_width, rs_height, rs_fps,
-         device, num_inference_steps, scheduler, num_samples,
+         device, num_inference_steps, n_act_exec, scheduler, num_samples,
          max_joint_speed, start_pose_ramp_sec, settle_sec,
-         dry_run, record, record_jpeg_quality, log_settle_err):
+         dry_run, record, record_jpeg_quality, video_fps, log_settle_err):
     if num_samples < 1:
         raise click.BadParameter('--num-samples must be >= 1')
+    if n_act_exec < 0:
+        raise click.BadParameter('--n-act-exec must be >= 0 (0 = use full chunk)')
     # 1. Load checkpoint
     print(f'Loading checkpoint: {ckpt_path}')
     payload = torch.load(open(ckpt_path, 'rb'), pickle_module=dill, map_location='cpu')
@@ -200,6 +271,12 @@ def main(ckpt_path, server_host, server_port,
     # assert n_obs==1
     n_act = policy.n_action_steps
     print(f'Policy ready: n_obs_steps={n_obs}, n_action_steps={n_act}, action_dim={policy.action_dim}')
+    if n_act_exec == 0:
+        n_act_exec = n_act
+    if n_act_exec > n_act:
+        raise click.BadParameter(
+            f'--n-act-exec ({n_act_exec}) > policy n_action_steps ({n_act})')
+    print(f'Will execute first {n_act_exec}/{n_act} actions per cycle')
 
     # Determine which observation keys this checkpoint actually expects.
     # Some checkpoints are image-only; others use image + state. We trust the
@@ -250,21 +327,28 @@ def main(ckpt_path, server_host, server_port,
 
     # 3b. Recording dir
     record_dir = None
+    obs_dir = None
     frame_idx = 0
     if record:
         ckpt = pathlib.Path(ckpt_path).resolve()
         run_stamp = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
         record_dir = ckpt.parent / ckpt.stem / run_stamp
-        record_dir.mkdir(parents=True, exist_ok=True)
-        print(f'Recording image observations to {record_dir}')
+        obs_dir = record_dir / 'observations'
+        obs_dir.mkdir(parents=True, exist_ok=True)
+        print(f'Recording observations to {obs_dir}')
+
+        # Start background video recorder. From here on grab() is non-blocking
+        # and returns the most recent frame the reader thread has cached.
+        grab, stop_camera = make_recording_wrapper(
+            grab, stop_camera, record_dir / 'rollout.mp4', video_fps)
 
     def save_obs(frame_chw_float: np.ndarray) -> None:
         nonlocal frame_idx
-        if record_dir is None:
+        if obs_dir is None:
             return
         rgb = (frame_chw_float.transpose(1, 2, 0) * 255.0).clip(0, 255).astype(np.uint8)
         bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-        out = record_dir / f'frame_{frame_idx:06d}.jpg'
+        out = obs_dir / f'frame_{frame_idx:06d}.jpg'
         cv2.imwrite(str(out), bgr,
                     [int(cv2.IMWRITE_JPEG_QUALITY), record_jpeg_quality])
         frame_idx += 1
@@ -334,7 +418,7 @@ def main(ckpt_path, server_host, server_port,
                     obs_t['state'] = torch.from_numpy(obs_state_np).to(device_t)
                 pred = policy.predict_action(obs_t)
             actions_all = pred['action'].cpu().numpy()  # (N, n_act, 7)
-            actions = actions_all[0]                    # send sample 0 to robot
+            actions = actions_all[0, :n_act_exec]       # send first n_act_exec waypoints of sample 0
             inference_latency = time.time() - t_inf_start
 
             # Persist the full (N, n_act, 7) tensor for offline analysis.
