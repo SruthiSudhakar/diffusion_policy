@@ -23,7 +23,7 @@ python examples/minimum_gello/minimum_gello.py --gripper linear_4310 --mode foll
 Terminal 2: inference (robodiff env)
 cd /home/cvlabusers/Appaji/diffusion_policy
 conda activate robodiff
-python run_diffusion_policy_blocking.py -i /home/cvlabusers/Appaji/diffusion_policy/data/jgd/2026.05.06/23.14.06_train_diffusion_unet_hybrid_pnp_lego_image/checkpoints/epoch=0400-train_loss=0.0049.ckpt
+python run_diffusion_policy_blocking.py -i /home/cvlabusers/Appaji/diffusion_policy/data/jgd/2026.05.06/23.17.10_train_diffusion_unet_hybrid_pnp_lego_image/checkpoints/epoch=0200-train_loss=0.0116.ckpt
 """
 import sys
 sys.stdout = open(sys.stdout.fileno(), mode='w', buffering=1)
@@ -515,12 +515,17 @@ def main(ckpt_path, server_host, server_port,
                     obs_t['state'] = torch.from_numpy(obs_state_np).to(device_t)
                 pred = policy.predict_action(obs_t)
             actions_all = pred['action'].cpu().numpy()  # (N, n_act, 7)
+            # Full unsliced horizon prediction from the policy (e.g. 32),
+            # before the n_action_steps window is applied. Same shape across
+            # samples; first n_act of axis=1 overlap with actions_all.
+            actions_full_all = pred['action_pred'].cpu().numpy()  # (N, horizon, 7)
             actions = actions_all[0, :n_act_exec]       # send first n_act_exec waypoints of sample 0
             inference_latency = time.time() - t_inf_start
 
             # Persist the full (N, n_act, 7) tensor for offline analysis.
             if record_dir is not None:
                 np.save(record_dir / f'actions_{cycle:06d}.npy', actions_all)
+                np.save(record_dir / f'actions_full_{cycle:06d}.npy', actions_full_all)
 
             # Per-DOF stats across the N samples. mean/min/max collapse over
             # both samples and time (chunk envelope per joint). std is
