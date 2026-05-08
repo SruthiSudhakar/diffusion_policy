@@ -26,7 +26,7 @@ JOINT_LABELS = ['j0', 'j1', 'j2', 'j3', 'j4', 'j5', 'gripper']
               help='Output PNG path (default: <run_dir>/sample_variance.png).')
 def main(run_dir, out_path):
     run_dir = pathlib.Path(run_dir)
-    action_files = sorted(run_dir.glob('actions_*.npy'))
+    action_files = sorted(run_dir.glob('actions_[0-9]*.npy'))
     if not action_files:
         sys.exit(f'no actions_*.npy under {run_dir}')
 

@@ -22,7 +22,7 @@ python examples/minimum_gello/minimum_gello.py --gripper linear_4310 --mode foll
 
 Terminal 2: inference (robodiff env)
 cd /home/cvlabusers/Appaji/diffusion_policy
-conda activate robodiff
+conda activate jgdrobodiff
 python run_diffusion_policy_blocking.py -i /home/cvlabusers/Appaji/diffusion_policy/data/jgd/2026.05.06/23.17.10_train_diffusion_unet_hybrid_pnp_lego_image/checkpoints/epoch=0200-train_loss=0.0116.ckpt
 """
 import sys
@@ -49,9 +49,20 @@ from diffusion_policy.workspace.base_workspace import BaseWorkspace
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 
+VIDEOGEN_REMOTE = "sruthi@cv16.cs.columbia.edu"
+VIDEOGEN_INBOX = "/proj/vondrick3/HunyuanVideo-1.5-train-sruthi/new_requests"
+VIDEOGEN_OUTPUTS = "/proj/vondrick3/HunyuanVideo-1.5-train-sruthi/outputs/generated_videos"
+VIDEOGEN_T = 33  # server's --video_length
+
 
 def make_local_grab(rs_width, rs_height, rs_fps):
-    """Open RealSense locally and return grab() -> (3,360,640) float32 RGB in [0,1]."""
+    """Open RealSense locally and return (grab, stop, get_raw_bgr).
+
+    grab() -> (3,360,640) float32 RGB in [0,1] (what the policy sees).
+    get_raw_bgr() -> latest captured raw BGR uint8 at native rs_width x rs_height,
+    for downstream consumers (e.g. video-gen submission). Raises if no frame
+    has been captured yet.
+    """
     import pyrealsense2 as rs  # imported here so cv12 doesn't need it
     print(f'Opening RealSense color stream: {rs_width}x{rs_height} @ {rs_fps} BGR8')
     pipe = rs.pipeline()
@@ -59,14 +70,26 @@ def make_local_grab(rs_width, rs_height, rs_fps):
     rs_cfg.enable_stream(rs.stream.color, rs_width, rs_height, rs.format.bgr8, rs_fps)
     pipe.start(rs_cfg)
 
+    raw_state = {'bgr': None}
+    raw_lock = threading.Lock()
+
     def grab():
         frames = pipe.wait_for_frames()
         bgr = np.asanyarray(frames.get_color_frame().get_data())
+        with raw_lock:
+            raw_state['bgr'] = bgr.copy()
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         rgb = cv2.resize(rgb, (640, 360), interpolation=cv2.INTER_AREA)
         return (rgb.astype(np.float32) / 255.0).transpose(2, 0, 1)
 
-    return grab, pipe.stop
+    def get_raw_bgr():
+        with raw_lock:
+            b = raw_state['bgr']
+        if b is None:
+            raise RuntimeError('get_raw_bgr() called before any frame captured')
+        return b.copy()
+
+    return grab, pipe.stop, get_raw_bgr
 
 
 def make_remote_grab(frame_host, frame_port):
@@ -91,7 +114,50 @@ def make_remote_grab(frame_host, frame_port):
     def stop():
         pass
 
-    return grab, stop
+    return grab, stop, None
+
+
+def submit_videogen(name, image_bgr, actions, scratch_dir):
+    """rsync (image, manifest) to cv16 inbox with atomic .partial -> .npy rename."""
+    img_path = scratch_dir / f'{name}.jpg'
+    cv2.imwrite(str(img_path), image_bgr,
+                [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+    manifest = {
+        'image_paths': np.array([f'{name}.jpg'] * len(actions)),
+        'trajectory': actions.astype(np.float64),
+    }
+    npy_path = scratch_dir / f'{name}.npy'
+    np.save(npy_path, manifest, allow_pickle=True)
+    subprocess.run(['rsync', str(img_path),
+                    f'{VIDEOGEN_REMOTE}:{VIDEOGEN_INBOX}/{name}.jpg'],
+                   check=True)
+    subprocess.run(['rsync', str(npy_path),
+                    f'{VIDEOGEN_REMOTE}:{VIDEOGEN_INBOX}/{name}.npy.partial'],
+                   check=True)
+    subprocess.run(['ssh', VIDEOGEN_REMOTE, 'mv',
+                    f'{VIDEOGEN_INBOX}/{name}.npy.partial',
+                    f'{VIDEOGEN_INBOX}/{name}.npy'],
+                   check=True)
+    print(f'videogen submitted: {name} -> '
+          f'{VIDEOGEN_REMOTE}:{VIDEOGEN_OUTPUTS}/*_{name}_generated.mp4')
+
+
+def wait_for_videogen(name, poll_sec, timeout_sec):
+    """Block until cv16 has produced *_<name>_generated.mp4. Raises on timeout."""
+    pattern = f'{VIDEOGEN_OUTPUTS}/*_{name}_generated.mp4'
+    deadline = time.time() + timeout_sec
+    t0 = time.time()
+    while time.time() < deadline:
+        rc = subprocess.run(
+            ['ssh', VIDEOGEN_REMOTE, 'ls', '-1', pattern],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        ).returncode
+        if rc == 0:
+            print(f'videogen ready: {name} (waited {time.time() - t0:.1f}s)')
+            return
+        time.sleep(poll_sec)
+    raise RuntimeError(
+        f'videogen timeout after {timeout_sec}s waiting for {pattern}')
 
 
 def make_recording_wrapper(grab_fn, stop_fn, video_path, fps):
@@ -287,17 +353,34 @@ def make_recording_wrapper(grab_fn, stop_fn, video_path, fps):
                    'video is finalized and the user is prompted to label '
                    'the rollout success/failure (used as a prefix on the '
                    'run dir).')
+@click.option('--videogen/--no-videogen', default=False,
+              help='If set, every cycle submits (raw 1280x720 image, sample-0 '
+                   'full 32-step prediction padded to 33) to the cv16 '
+                   'HunyuanVideo server and BLOCKS until the resulting mp4 '
+                   'appears before scheduling the chunk on the robot. '
+                   'Requires --frame-source local.')
+@click.option('--videogen-poll-sec', default=5.0, type=float,
+              help='How often to poll cv16 for the generated mp4.')
+@click.option('--videogen-timeout-sec', default=1800.0, type=float,
+              help='Hard ceiling on how long to wait per cycle for cv16. '
+                   'Exceeding this raises and the rollout crashes (after '
+                   'holding pose).')
 def main(ckpt_path, server_host, server_port,
          frame_source, frame_host, frame_port,
          frequency, rs_width, rs_height, rs_fps,
          device, num_inference_steps, n_act_exec, scheduler, num_samples,
          max_joint_speed, start_pose_ramp_sec, settle_sec,
          dry_run, record, record_jpeg_quality, video_fps, log_settle_err,
-         max_steps):
+         max_steps,
+         videogen, videogen_poll_sec, videogen_timeout_sec):
     if num_samples < 1:
         raise click.BadParameter('--num-samples must be >= 1')
     if n_act_exec < 0:
         raise click.BadParameter('--n-act-exec must be >= 0 (0 = use full chunk)')
+    if videogen and frame_source != 'local':
+        raise click.BadParameter(
+            '--videogen requires --frame-source local (raw 1280x720 frames '
+            'are only available from the RealSense path).')
     # 1. Load checkpoint
     print(f'Loading checkpoint: {ckpt_path}')
     payload = torch.load(open(ckpt_path, 'rb'), pickle_module=dill, map_location='cpu')
@@ -403,17 +486,18 @@ def main(ckpt_path, server_host, server_port,
 
     # 3. Frame source
     if frame_source == 'local':
-        grab, stop_camera = make_local_grab(rs_width, rs_height, rs_fps)
+        grab, stop_camera, get_raw_bgr = make_local_grab(rs_width, rs_height, rs_fps)
     else:
-        grab, stop_camera = make_remote_grab(frame_host, frame_port)
+        grab, stop_camera, get_raw_bgr = make_remote_grab(frame_host, frame_port)
 
-    # 3b. Recording dir
+    # 3b. Recording dir. run_stamp is always defined (used as <name> prefix
+    # for videogen even when --no-record).
+    run_stamp = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
     record_dir = None
     obs_dir = None
     frame_idx = 0
     if record:
         ckpt = pathlib.Path(ckpt_path).resolve()
-        run_stamp = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
         record_dir = ckpt.parent / ckpt.stem / run_stamp
         obs_dir = record_dir / 'observations'
         obs_dir.mkdir(parents=True, exist_ok=True)
@@ -546,6 +630,22 @@ def main(ckpt_path, server_host, server_port,
             for t in range(sample_std.shape[0]):
                 print(f'    t={t:2d}: {fmt(sample_std[t])}')
 
+            # ---- 6b. Submit to cv16 video-gen and BLOCK on completion ----
+            # Robot stays paused at the previous chunk's last waypoint until
+            # the cv16 mp4 for THIS cycle's prediction exists. The
+            # schedule_anchor below is therefore set after the wait, so
+            # action timestamps are anchored at "now" post-wait.
+            if videogen:
+                raw_bgr = get_raw_bgr()
+                full = actions_full_all[0]                          # (32, 7)
+                full33 = np.concatenate([full, full[-1:]], axis=0)  # (33, 7)
+                name = f'{run_stamp}_{cycle:06d}'
+                scratch = (record_dir / 'videogen') if record_dir is not None \
+                          else pathlib.Path('/tmp')
+                scratch.mkdir(parents=True, exist_ok=True)
+                submit_videogen(name, raw_bgr, full33, scratch)
+                wait_for_videogen(name, videogen_poll_sec, videogen_timeout_sec)
+
             # ---- 7. Schedule the entire chunk back-to-back, starting now ----
             schedule_anchor = time.time()
             action_ts = (np.arange(1, len(actions) + 1, dtype=np.float64) * dt
@@ -582,6 +682,18 @@ def main(ckpt_path, server_host, server_port,
         except Exception as e:
             print(f'Failed to hold pose: {e}')
         stop_reason = 'keyboard_interrupt'
+    except Exception as e:
+        import traceback
+        print(f'\nLoop crashed: {e!r}. Holding current pose before re-raising.')
+        traceback.print_exc()
+        try:
+            client.clear_waypoints()
+            cur = client.get_joint_pos().result()
+            client.command_joint_pos(cur)
+        except Exception as e2:
+            print(f'Failed to hold pose: {e2}')
+        stop_reason = f'exception:{type(e).__name__}'
+        raise
     finally:
         stop_camera()
         print(f'Run finished after {total_steps} action waypoints over '
