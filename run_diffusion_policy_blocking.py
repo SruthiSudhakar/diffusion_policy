@@ -117,14 +117,19 @@ def make_remote_grab(frame_host, frame_port):
     return grab, stop, None
 
 
-def submit_videogen(name, image_bgr, actions, scratch_dir):
-    """rsync (image, manifest) to cv16 inbox with atomic .partial -> .npy rename."""
+def submit_videogen(name, image_bgr, actions_NT7, scratch_dir):
+    """rsync (image, manifest) to cv16 inbox with atomic .partial -> .npy rename.
+
+    actions_NT7 has shape (N, T, 7). Server (updated) accepts a 3-D
+    trajectory and produces N mp4s per request.
+    """
     img_path = scratch_dir / f'{name}.jpg'
     cv2.imwrite(str(img_path), image_bgr,
                 [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+    T = actions_NT7.shape[1]
     manifest = {
-        'image_paths': np.array([f'{name}.jpg'] * len(actions)),
-        'trajectory': actions.astype(np.float64),
+        'image_paths': np.array([f'{name}.jpg'] * T),
+        'trajectory': actions_NT7.astype(np.float64),  # (N, T, 7)
     }
     npy_path = scratch_dir / f'{name}.npy'
     np.save(npy_path, manifest, allow_pickle=True)
@@ -138,26 +143,53 @@ def submit_videogen(name, image_bgr, actions, scratch_dir):
                     f'{VIDEOGEN_INBOX}/{name}.npy.partial',
                     f'{VIDEOGEN_INBOX}/{name}.npy'],
                    check=True)
-    print(f'videogen submitted: {name} -> '
-          f'{VIDEOGEN_REMOTE}:{VIDEOGEN_OUTPUTS}/*_{name}_generated.mp4')
+    print(f'videogen submitted: {name} (N={actions_NT7.shape[0]}, T={T}) -> '
+          f'{VIDEOGEN_REMOTE}:{VIDEOGEN_OUTPUTS}/{name}/*.mp4')
 
 
-def wait_for_videogen(name, poll_sec, timeout_sec):
-    """Block until cv16 has produced *_<name>_generated.mp4. Raises on timeout."""
-    pattern = f'{VIDEOGEN_OUTPUTS}/*_{name}_generated.mp4'
+def fetch_videogen(name, dest_dir):
+    """rsync the cv16 output subdir for <name> into dest_dir/<name>/."""
+    local = dest_dir / name
+    local.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ['rsync', '-a',
+         f'{VIDEOGEN_REMOTE}:{VIDEOGEN_OUTPUTS}/{name}/',
+         f'{local}/'],
+        check=True,
+    )
+    print(f'videogen fetched: {name} -> {local}')
+
+
+def wait_for_videogen(name, expected_count, poll_sec, timeout_sec):
+    """Block until cv16 has produced >= expected_count mp4s in
+    <VIDEOGEN_OUTPUTS>/<name>/ (server writes 0.mp4, 1.mp4, ... per sample).
+    Raises on timeout."""
+    out_dir = f'{VIDEOGEN_OUTPUTS}/{name}'
+    pattern = f'{out_dir}/*.mp4'
     deadline = time.time() + timeout_sec
     t0 = time.time()
+    last_count = -1
     while time.time() < deadline:
-        rc = subprocess.run(
-            ['ssh', VIDEOGEN_REMOTE, 'ls', '-1', pattern],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        ).returncode
-        if rc == 0:
+        result = subprocess.run(
+            ['ssh', VIDEOGEN_REMOTE,
+             f'ls -1 {pattern} 2>/dev/null | wc -l'],
+            capture_output=True, text=True,
+        )
+        try:
+            count = int(result.stdout.strip() or '0')
+        except ValueError:
+            count = 0
+        if count != last_count:
+            print(f'videogen waiting: {name} {count}/{expected_count} '
+                  f'(elapsed {time.time() - t0:.1f}s)')
+            last_count = count
+        if count >= expected_count:
             print(f'videogen ready: {name} (waited {time.time() - t0:.1f}s)')
             return
         time.sleep(poll_sec)
     raise RuntimeError(
-        f'videogen timeout after {timeout_sec}s waiting for {pattern}')
+        f'videogen timeout after {timeout_sec}s waiting for {expected_count} '
+        f'mp4s matching {pattern} (last count={last_count})')
 
 
 def make_recording_wrapper(grab_fn, stop_fn, video_path, fps):
@@ -310,7 +342,7 @@ def make_recording_wrapper(grab_fn, stop_fn, video_path, fps):
               help='Number of actions to actually execute from each predicted '
                    'chunk of length n_action_steps (e.g. 16). 0 (default) means '
                    'execute the full chunk. Must be in [1, n_action_steps].')
-@click.option('--num-samples', default=5, type=int,
+@click.option('--num-samples', default=4, type=int,
               help='Number of action chunks to sample per observation. The same '
                    'obs is tiled along the batch dim and run through the policy '
                    'in a single forward pass; each sample uses an independent '
@@ -637,14 +669,20 @@ def main(ckpt_path, server_host, server_port,
             # action timestamps are anchored at "now" post-wait.
             if videogen:
                 raw_bgr = get_raw_bgr()
-                full = actions_full_all[0]                          # (32, 7)
-                full33 = np.concatenate([full, full[-1:]], axis=0)  # (33, 7)
+                # actions_full_all: (N, 32, 7). Pad along time to T=33 by
+                # repeating each sample's last action once (T must be 4n+1
+                # and <= 33 per server contract; 33 = 4*8+1).
+                full_NT7 = np.concatenate(
+                    [actions_full_all, actions_full_all[:, -1:, :]],
+                    axis=1)                                         # (N, 33, 7)
                 name = f'{run_stamp}_{cycle:06d}'
                 scratch = (record_dir / 'videogen') if record_dir is not None \
                           else pathlib.Path('/tmp')
                 scratch.mkdir(parents=True, exist_ok=True)
-                submit_videogen(name, raw_bgr, full33, scratch)
-                wait_for_videogen(name, videogen_poll_sec, videogen_timeout_sec)
+                submit_videogen(name, raw_bgr, full_NT7, scratch)
+                wait_for_videogen(name, num_samples,
+                                  videogen_poll_sec, videogen_timeout_sec)
+                fetch_videogen(name, scratch)
 
             # ---- 7. Schedule the entire chunk back-to-back, starting now ----
             schedule_anchor = time.time()
