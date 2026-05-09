@@ -25,7 +25,7 @@ cd /home/cvlabusers/Appaji/diffusion_policy
 conda activate jgdrobodiff
 python run_diffusion_policy_blocking.py \
 -i /home/cvlabusers/Appaji/diffusion_policy/data/jgd/2026.05.06/23.17.10_train_diffusion_unet_hybrid_pnp_lego_image/checkpoints/epoch=0200-train_loss=0.0116.ckpt \
---video-gen --num-samples 4
+--videogen --num-samples 4 --picked-up
 """
 import sys
 sys.stdout = open(sys.stdout.fileno(), mode='w', buffering=1)
@@ -56,6 +56,8 @@ VIDEOGEN_REMOTE = "sruthi@cv16.cs.columbia.edu"
 VIDEOGEN_INBOX = "/proj/vondrick3/HunyuanVideo-1.5-train-sruthi/new_requests"
 VIDEOGEN_OUTPUTS = "/proj/vondrick3/HunyuanVideo-1.5-train-sruthi/outputs/generated_videos"
 VIDEOGEN_T = 33  # server's --video_length
+
+PICKUP_TRAJ_PATH = '/home/cvlabusers/Appaji/i2rt/pickup.npy'
 
 
 def make_local_grab(rs_width, rs_height, rs_fps):
@@ -223,6 +225,58 @@ def wait_for_ranking(name, poll_sec, timeout_sec):
         f'ranking timeout after {timeout_sec}s waiting for {target}')
 
 
+def _load_pickup_npy(path):
+    """np.load(path).item() with a sys.modules shim so files pickled by
+    numpy 2.x (which references numpy._core) load under numpy 1.x."""
+    import sys
+    import numpy.core
+    sys.modules.setdefault('numpy._core', numpy.core)
+    for sub in ('multiarray', 'numeric', '_multiarray_umath', 'umath',
+                'fromnumeric', '_methods', 'arrayprint'):
+        full = f'numpy.core.{sub}'
+        if full in sys.modules:
+            sys.modules.setdefault(f'numpy._core.{sub}', sys.modules[full])
+    return np.load(path, allow_pickle=True).item()
+
+
+def replay_pickup_trajectory(client):
+    """Replay PICKUP_TRAJ_PATH on the follower.
+
+    Mirrors the `l` + `p` flow in
+    i2rt/examples/record_replay_trajectory/record_replay_trajectory_client.py:
+    1.5 s linear ramp from the current pose to trajectory[0] via
+    command_joint_pos at 60 Hz, then command_joint_pos for each
+    remaining waypoint at the recorded frequency (default 30 Hz).
+    """
+    data = _load_pickup_npy(PICKUP_TRAJ_PATH)
+    traj = np.asarray(data['trajectory'])
+    freq = float(data.get('frequency', 30.0))
+    dt = 1.0 / freq
+    n = traj.shape[0]
+    if n == 0:
+        raise RuntimeError(f'{PICKUP_TRAJ_PATH} contains an empty trajectory')
+    print(f'Replaying pickup trajectory: {PICKUP_TRAJ_PATH} '
+          f'({n} samples @ {freq:.1f} Hz, ~{n*dt:.2f}s)')
+
+    client.clear_waypoints()
+    start = client.get_joint_pos().result()
+    target0 = traj[0]
+    ramp_sec = 1.5
+    steps = max(2, int(ramp_sec * 60))
+    for i in range(1, steps + 1):
+        q = start + (target0 - start) * (i / steps)
+        client.command_joint_pos(q)
+        time.sleep(ramp_sec / steps)
+
+    last = time.monotonic()
+    for idx in range(n):
+        while time.monotonic() - last < dt:
+            time.sleep(0.001)
+        client.command_joint_pos(traj[idx])
+        last = time.monotonic()
+    print(f'Pickup replay finished. Final pose: {client.get_joint_pos().result()}')
+
+
 def make_recording_wrapper(grab_fn, stop_fn, video_path, fps):
     """Pull frames continuously in a background thread; write each to an mp4
     at `fps` and cache the latest one for the main loop to read as an obs.
@@ -388,6 +442,13 @@ def make_recording_wrapper(grab_fn, stop_fn, video_path, fps):
               help='Per-joint L_inf speed cap (rad/s) for the i2rt interpolator.')
 @click.option('--start-pose-ramp-sec', default=2.0, type=float,
               help='Wall-clock duration for the smooth ramp to start_pose at boot.')
+@click.option('--picked-up', is_flag=True, default=False,
+              help='Skip the fixed start-pose ramp and instead replay '
+                   '/home/cvlabusers/Appaji/i2rt/pickup.npy on the follower '
+                   '(matches pressing l then p in '
+                   'examples/record_replay_trajectory/record_replay_trajectory_client.py). '
+                   'The diffusion-policy loop then begins from wherever the '
+                   'replay ended.')
 @click.option('--settle-sec', default=0.5, type=float,
               help='Extra wait after the last waypoint\'s target time before '
                    'capturing the next observation. Lets the interpolator '
@@ -429,14 +490,20 @@ def make_recording_wrapper(grab_fn, stop_fn, video_path, fps):
               help='Hard ceiling on how long to wait per cycle for cv16. '
                    'Exceeding this raises and the rollout crashes (after '
                    'holding pose).')
+@click.option('--output-prefix', default='', type=str,
+              help='Optional string prepended to the run directory name. '
+                   'Stays in front even after the success/failure label is '
+                   'added (e.g. "exp1" -> "exp1_success_<timestamp>...". '
+                   'Default empty (no prefix).')
 def main(ckpt_path, server_host, server_port,
          frame_source, frame_host, frame_port,
          frequency, rs_width, rs_height, rs_fps,
          device, num_inference_steps, n_act_exec, scheduler, num_samples,
-         max_joint_speed, start_pose_ramp_sec, settle_sec,
+         max_joint_speed, start_pose_ramp_sec, picked_up, settle_sec,
          dry_run, record, record_jpeg_quality, video_fps, log_settle_err,
          max_steps,
-         videogen, videogen_poll_sec, videogen_timeout_sec):
+         videogen, videogen_poll_sec, videogen_timeout_sec,
+         output_prefix):
     if num_samples < 1:
         raise click.BadParameter('--num-samples must be >= 1')
     if n_act_exec < 0:
@@ -530,23 +597,30 @@ def main(ckpt_path, server_host, server_port,
             f'Follower DOF ({cur.shape[0]}) != policy action_dim ({policy.action_dim}). '
             'Check the follower\'s gripper config.')
 
-    # 2b. Move follower to the fixed start pose
-    start_pose = np.array([
-        -0.02651255, 1.53639277, 1.49328603, -1.66189822,
-        0.02994583, 0.05359731, 0.99420248,
-    ], dtype=np.float64)
-    if start_pose.shape[0] != policy.action_dim:
-        raise RuntimeError(
-            f'Start pose dim ({start_pose.shape[0]}) != policy action_dim ({policy.action_dim}).')
-    print(f'Moving follower to start pose over {start_pose_ramp_sec:.2f}s: {start_pose}')
-    client.clear_waypoints()
-    client.schedule_waypoint(
-        start_pose,
-        time.time() + start_pose_ramp_sec,
-        max_joint_speed,
-    )
-    time.sleep(start_pose_ramp_sec + 0.2)
-    print(f'Reached start pose: {client.get_joint_pos().result()}')
+    # 2b. Either replay pickup.npy or move follower to the fixed start pose.
+    if picked_up:
+        if dry_run:
+            print('--dry-run with --picked-up: skipping pickup replay '
+                  '(no commands will be sent to the robot).')
+        else:
+            replay_pickup_trajectory(client)
+    else:
+        start_pose = np.array([
+            -0.02651255, 1.53639277, 1.49328603, -1.66189822,
+            0.02994583, 0.05359731, 0.99420248,
+        ], dtype=np.float64)
+        if start_pose.shape[0] != policy.action_dim:
+            raise RuntimeError(
+                f'Start pose dim ({start_pose.shape[0]}) != policy action_dim ({policy.action_dim}).')
+        print(f'Moving follower to start pose over {start_pose_ramp_sec:.2f}s: {start_pose}')
+        client.clear_waypoints()
+        client.schedule_waypoint(
+            start_pose,
+            time.time() + start_pose_ramp_sec,
+            max_joint_speed,
+        )
+        time.sleep(start_pose_ramp_sec + 0.2)
+        print(f'Reached start pose: {client.get_joint_pos().result()}')
 
     # 3. Frame source
     if frame_source == 'local':
@@ -560,9 +634,15 @@ def main(ckpt_path, server_host, server_port,
     record_dir = None
     obs_dir = None
     frame_idx = 0
+    prefix_str = f'{output_prefix}_' if output_prefix else ''
     if record:
         ckpt = pathlib.Path(ckpt_path).resolve()
-        run_dir_name = f'{run_stamp}_VLM' if videogen else run_stamp
+        base_name = run_stamp
+        if videogen:
+            base_name += '_VLM'
+        if picked_up:
+            base_name += '_pickedup'
+        run_dir_name = f'{prefix_str}{base_name}'
         record_dir = ckpt.parent / ckpt.stem / run_dir_name
         obs_dir = record_dir / 'observations'
         obs_dir.mkdir(parents=True, exist_ok=True)
@@ -828,7 +908,7 @@ def main(ckpt_path, server_host, server_port,
                 else:
                     print("  Please type 's' (success) or 'f' (failure).")
             if label is not None:
-                new_dir = record_dir.parent / f'{label}_{record_dir.name}'
+                new_dir = record_dir.parent / f'{prefix_str}{label}_{base_name}'
                 try:
                     record_dir.rename(new_dir)
                     final_dir = new_dir
