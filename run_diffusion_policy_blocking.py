@@ -470,7 +470,7 @@ def make_recording_wrapper(grab_fn, stop_fn, video_path, fps):
                    'the robot\'s actual position and the last scheduled action. '
                    'Use to tune --settle-sec / --max-joint-speed. Skipped under '
                    '--dry-run since no commands are sent.')
-@click.option('--max-steps', default=300, type=int,
+@click.option('--max-steps', default=240, type=int,
               help='Max total action waypoints scheduled to the robot before '
                    'the loop auto-stops (each cycle schedules n_act_exec). '
                    'Stop is also triggered by Ctrl+C. After either, the '
@@ -495,6 +495,16 @@ def make_recording_wrapper(grab_fn, stop_fn, video_path, fps):
                    'Stays in front even after the success/failure label is '
                    'added (e.g. "exp1" -> "exp1_success_<timestamp>...". '
                    'Default empty (no prefix).')
+@click.option('--seed', default=0, type=int,
+              help='Base RNG seed. Before each predict_action call we set '
+                   'torch.manual_seed(seed + cycle), which makes the N '
+                   'diffusion noise inits reproducible across runs: at '
+                   'cycle k, sample i is the same noise tensor in every run '
+                   'with the same --seed (the N samples within a cycle are '
+                   'still diverse, since they are N consecutive draws of one '
+                   'randn call). Combined with cudnn.deterministic=True and '
+                   'identical obs conditioning, this yields identical '
+                   'action chunks across runs. Default 0.')
 def main(ckpt_path, server_host, server_port,
          frame_source, frame_host, frame_port,
          frequency, rs_width, rs_height, rs_fps,
@@ -503,7 +513,7 @@ def main(ckpt_path, server_host, server_port,
          dry_run, record, record_jpeg_quality, video_fps, log_settle_err,
          max_steps,
          videogen, videogen_poll_sec, videogen_timeout_sec,
-         output_prefix):
+         output_prefix, seed):
     if num_samples < 1:
         raise click.BadParameter('--num-samples must be >= 1')
     if n_act_exec < 0:
@@ -525,6 +535,11 @@ def main(ckpt_path, server_host, server_port,
     device_t = torch.device(device)
     if device_t.type == 'cpu':
         print('WARNING: running on CPU. Each inference call will be very slow.')
+    # Reproducibility: deterministic cuDNN kernels so that, given identical
+    # noise init + identical obs, predict_action produces identical actions
+    # across runs (no float-level drift from kernel autotuning).
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
     policy.to(device_t).eval()
     if hasattr(policy, 'num_inference_steps'):
         old_steps = policy.num_inference_steps
@@ -670,6 +685,11 @@ def main(ckpt_path, server_host, server_port,
     print(f'Warming up policy inference (batch={num_samples})')
     f_warm = grab()
     q_warm = client.get_joint_pos().result().astype(np.float32)
+    # Use a separate seed for warm-up so it doesn't consume the per-cycle
+    # RNG state we'll set inside the loop.
+    torch.manual_seed(seed - 1)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed - 1)
     with torch.no_grad():
         if hasattr(policy, 'reset'):
             policy.reset()
@@ -735,6 +755,14 @@ def main(ckpt_path, server_host, server_port,
                 ).copy()                                                  # (N, n_obs, 7)
 
             # ---- 6. Inference (batched: one forward pass -> N samples) ----
+            # Re-seed per cycle so the N noise inits at cycle k are reproducible
+            # across runs (run-A's i-th sample == run-B's i-th sample at the
+            # same cycle, given identical obs). The N samples within this call
+            # are still diverse: they are N consecutive draws from one randn.
+            cycle_seed = seed + cycle
+            torch.manual_seed(cycle_seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(cycle_seed)
             t_inf_start = time.time()
             with torch.no_grad():
                 obs_t = {
