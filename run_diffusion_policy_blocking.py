@@ -894,20 +894,12 @@ def main(ckpt_path, server_host, server_port,
               f'{cycle} cycles (stop_reason={stop_reason}).')
         final_dir = record_dir
         if record_dir is not None:
-            label = None
-            while label is None:
-                try:
-                    ans = input('Label this rollout — [s]uccess or [f]ailure? ').strip().lower()
-                except EOFError:
-                    print('No input available; leaving run dir unlabeled.')
-                    break
-                if ans in ('s', 'success'):
-                    label = 'success'
-                elif ans in ('f', 'failure', 'fail'):
-                    label = 'failure'
-                else:
-                    print("  Please type 's' (success) or 'f' (failure).")
-            if label is not None:
+            try:
+                label = input('Label this rollout (free text, blank to skip): ').strip()
+            except EOFError:
+                print('No input available; leaving run dir unlabeled.')
+                label = ''
+            if label:
                 new_dir = record_dir.parent / f'{prefix_str}{label}_{base_name}'
                 try:
                     record_dir.rename(new_dir)
