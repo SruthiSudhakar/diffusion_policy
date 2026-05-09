@@ -23,13 +23,16 @@ python examples/minimum_gello/minimum_gello.py --gripper linear_4310 --mode foll
 Terminal 2: inference (robodiff env)
 cd /home/cvlabusers/Appaji/diffusion_policy
 conda activate jgdrobodiff
-python run_diffusion_policy_blocking.py -i /home/cvlabusers/Appaji/diffusion_policy/data/jgd/2026.05.06/23.17.10_train_diffusion_unet_hybrid_pnp_lego_image/checkpoints/epoch=0200-train_loss=0.0116.ckpt
+python run_diffusion_policy_blocking.py \
+-i /home/cvlabusers/Appaji/diffusion_policy/data/jgd/2026.05.06/23.17.10_train_diffusion_unet_hybrid_pnp_lego_image/checkpoints/epoch=0200-train_loss=0.0116.ckpt \
+--video-gen --num-samples 4
 """
 import sys
 sys.stdout = open(sys.stdout.fileno(), mode='w', buffering=1)
 sys.stderr = open(sys.stderr.fileno(), mode='w', buffering=1)
 
 import datetime
+import json
 import pathlib
 import shutil
 import subprocess
@@ -190,6 +193,34 @@ def wait_for_videogen(name, expected_count, poll_sec, timeout_sec):
     raise RuntimeError(
         f'videogen timeout after {timeout_sec}s waiting for {expected_count} '
         f'mp4s matching {pattern} (last count={last_count})')
+
+
+def wait_for_ranking(name, poll_sec, timeout_sec):
+    """Block until cv16 has produced ranking.json in
+    <VIDEOGEN_OUTPUTS>/<name>/. Raises on timeout."""
+    out_dir = f'{VIDEOGEN_OUTPUTS}/{name}'
+    target = f'{out_dir}/ranking.json'
+    deadline = time.time() + timeout_sec
+    t0 = time.time()
+    last_present = None
+    while time.time() < deadline:
+        result = subprocess.run(
+            ['ssh', VIDEOGEN_REMOTE,
+             f'test -f {target} && echo ok || echo missing'],
+            capture_output=True, text=True,
+        )
+        present = result.stdout.strip() == 'ok'
+        if present != last_present:
+            print(f'ranking waiting: {name} '
+                  f'{"present" if present else "missing"} '
+                  f'(elapsed {time.time() - t0:.1f}s)')
+            last_present = present
+        if present:
+            print(f'ranking ready: {name} (waited {time.time() - t0:.1f}s)')
+            return
+        time.sleep(poll_sec)
+    raise RuntimeError(
+        f'ranking timeout after {timeout_sec}s waiting for {target}')
 
 
 def make_recording_wrapper(grab_fn, stop_fn, video_path, fps):
@@ -386,11 +417,12 @@ def make_recording_wrapper(grab_fn, stop_fn, video_path, fps):
                    'the rollout success/failure (used as a prefix on the '
                    'run dir).')
 @click.option('--videogen/--no-videogen', default=False,
-              help='If set, every cycle submits (raw 1280x720 image, sample-0 '
-                   'full 32-step prediction padded to 33) to the cv16 '
-                   'HunyuanVideo server and BLOCKS until the resulting mp4 '
-                   'appears before scheduling the chunk on the robot. '
-                   'Requires --frame-source local.')
+              help='If set, every cycle submits (raw 1280x720 image, all N '
+                   'samples\' full 32-step predictions padded to 33) to the '
+                   'cv16 HunyuanVideo server and BLOCKS until the resulting '
+                   'mp4s and ranking.json appear, then executes '
+                   'actions_all[winner_idx] (the VLM-chosen chunk) instead '
+                   'of sample 0. Requires --frame-source local.')
 @click.option('--videogen-poll-sec', default=5.0, type=float,
               help='How often to poll cv16 for the generated mp4.')
 @click.option('--videogen-timeout-sec', default=1800.0, type=float,
@@ -530,7 +562,8 @@ def main(ckpt_path, server_host, server_port,
     frame_idx = 0
     if record:
         ckpt = pathlib.Path(ckpt_path).resolve()
-        record_dir = ckpt.parent / ckpt.stem / run_stamp
+        run_dir_name = f'{run_stamp}_VLM' if videogen else run_stamp
+        record_dir = ckpt.parent / ckpt.stem / run_dir_name
         obs_dir = record_dir / 'observations'
         obs_dir.mkdir(parents=True, exist_ok=True)
         print(f'Recording observations to {obs_dir}')
@@ -635,7 +668,6 @@ def main(ckpt_path, server_host, server_port,
             # before the n_action_steps window is applied. Same shape across
             # samples; first n_act of axis=1 overlap with actions_all.
             actions_full_all = pred['action_pred'].cpu().numpy()  # (N, horizon, 7)
-            actions = actions_all[0, :n_act_exec]       # send first n_act_exec waypoints of sample 0
             inference_latency = time.time() - t_inf_start
 
             # Persist the full (N, n_act, 7) tensor for offline analysis.
@@ -664,9 +696,10 @@ def main(ckpt_path, server_host, server_port,
 
             # ---- 6b. Submit to cv16 video-gen and BLOCK on completion ----
             # Robot stays paused at the previous chunk's last waypoint until
-            # the cv16 mp4 for THIS cycle's prediction exists. The
+            # the cv16 mp4s AND ranking.json for THIS cycle exist. The
             # schedule_anchor below is therefore set after the wait, so
             # action timestamps are anchored at "now" post-wait.
+            winner_idx = 0
             if videogen:
                 raw_bgr = get_raw_bgr()
                 # actions_full_all: (N, 32, 7). Pad along time to T=33 by
@@ -682,9 +715,52 @@ def main(ckpt_path, server_host, server_port,
                 submit_videogen(name, raw_bgr, full_NT7, scratch)
                 wait_for_videogen(name, num_samples,
                                   videogen_poll_sec, videogen_timeout_sec)
+                wait_for_ranking(name, videogen_poll_sec, videogen_timeout_sec)
                 fetch_videogen(name, scratch)
+                ranking_path = scratch / name / 'ranking.json'
+                with open(ranking_path) as rf:
+                    ranking = json.load(rf)
+                winner_idx = int(ranking['winner_idx'])
+                if not (0 <= winner_idx < num_samples):
+                    raise RuntimeError(
+                        f'ranking.json winner_idx={winner_idx} out of range '
+                        f'[0, {num_samples}) at {ranking_path}')
+                print(f'cycle {cycle}: VLM winner_idx={winner_idx} '
+                      f'(votes={ranking.get("votes")}, '
+                      f'tied={ranking.get("tied_indices")})')
+
+                """
+                Variant: 30 hz interpolation:
+                raw_bgr = get_raw_bgr()
+                # actions_full_all: (N, 32, 7) at 15Hz (policy rate). The
+                # video model was trained at 30Hz, so its expected per-step
+                # delta is ~2x smaller. Linearly upsample to 64 points at
+                # 30Hz (even indices = original; odd indices = midpoints),
+                # then send the first 33 (= 4*8+1, the server's 4n+1 cap).
+                # Covers the first ~1.1s of the horizon, in-distribution
+                # for the video model.
+                N_s, T_orig, D = actions_full_all.shape
+                full_30hz = np.empty((N_s, 2 * T_orig, D),
+                                     dtype=actions_full_all.dtype)
+                full_30hz[:, 0::2, :] = actions_full_all
+                full_30hz[:, 1:-1:2, :] = 0.5 * (
+                    actions_full_all[:, :-1, :] + actions_full_all[:, 1:, :])
+                full_30hz[:, -1, :] = actions_full_all[:, -1, :]
+                full_NT7 = full_30hz[:, :33, :]                     # (N, 33, 7)
+                name = f'{run_stamp}_{cycle:06d}'
+                scratch = (record_dir / 'videogen') if record_dir is not None \
+                          else pathlib.Path('/tmp')
+                scratch.mkdir(parents=True, exist_ok=True)
+                submit_videogen(name, raw_bgr, full_NT7, scratch)
+                wait_for_videogen(name, num_samples,
+                                  videogen_poll_sec, videogen_timeout_sec)
+                fetch_videogen(name, scratch)
+                """
 
             # ---- 7. Schedule the entire chunk back-to-back, starting now ----
+            # Under --videogen, winner_idx is the VLM-chosen sample. Otherwise
+            # it stays at 0 (sample 0 drives the robot).
+            actions = actions_all[winner_idx, :n_act_exec]
             schedule_anchor = time.time()
             action_ts = (np.arange(1, len(actions) + 1, dtype=np.float64) * dt
                          + schedule_anchor)
