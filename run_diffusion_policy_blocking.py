@@ -24,8 +24,8 @@ Terminal 2: inference (robodiff env)
 cd /home/cvlabusers/Appaji/diffusion_policy
 conda activate jgdrobodiff
 python run_diffusion_policy_blocking.py \
--i /home/cvlabusers/Appaji/diffusion_policy/data/jgd/2026.05.06/23.17.10_train_diffusion_unet_hybrid_pnp_lego_image/checkpoints/epoch=0200-train_loss=0.0116.ckpt \
---videogen --num-samples 4 --picked-up
+-i /home/cvlabusers/Appaji/diffusion_policy/data/jgd/2026.05.06/23.17.10_train_diffusion_unet_hybrid_pnp_lego_image/checkpoints/epoch=0200-train_loss=0.0116.ckpt --videogen
+ --num-samples 4 --picked-up
 """
 import sys
 sys.stdout = open(sys.stdout.fileno(), mode='w', buffering=1)
@@ -122,6 +122,25 @@ def make_remote_grab(frame_host, frame_port):
     return grab, stop, None
 
 
+def _run_net_with_retries(cmd, *, attempts=5, base_delay=2.0, label=None):
+    """subprocess.run(check=True) with exponential backoff for transient
+    ssh/rsync failures (DNS hiccups, dropped connections). Reraises after
+    the final attempt. Backoff: 2, 4, 8, 16s -> ~30s of slack before giving up.
+    """
+    label = label or cmd[0]
+    for i in range(1, attempts + 1):
+        try:
+            subprocess.run(cmd, check=True)
+            return
+        except subprocess.CalledProcessError as e:
+            if i == attempts:
+                raise
+            delay = base_delay * (2 ** (i - 1))
+            print(f'{label} attempt {i}/{attempts} failed (exit {e.returncode}); '
+                  f'retrying in {delay:.1f}s')
+            time.sleep(delay)
+
+
 def submit_videogen(name, image_bgr, actions_NT7, scratch_dir):
     """rsync (image, manifest) to cv16 inbox with atomic .partial -> .npy rename.
 
@@ -138,16 +157,19 @@ def submit_videogen(name, image_bgr, actions_NT7, scratch_dir):
     }
     npy_path = scratch_dir / f'{name}.npy'
     np.save(npy_path, manifest, allow_pickle=True)
-    subprocess.run(['rsync', str(img_path),
-                    f'{VIDEOGEN_REMOTE}:{VIDEOGEN_INBOX}/{name}.jpg'],
-                   check=True)
-    subprocess.run(['rsync', str(npy_path),
-                    f'{VIDEOGEN_REMOTE}:{VIDEOGEN_INBOX}/{name}.npy.partial'],
-                   check=True)
-    subprocess.run(['ssh', VIDEOGEN_REMOTE, 'mv',
-                    f'{VIDEOGEN_INBOX}/{name}.npy.partial',
-                    f'{VIDEOGEN_INBOX}/{name}.npy'],
-                   check=True)
+    _run_net_with_retries(
+        ['rsync', str(img_path),
+         f'{VIDEOGEN_REMOTE}:{VIDEOGEN_INBOX}/{name}.jpg'],
+        label='rsync img')
+    _run_net_with_retries(
+        ['rsync', str(npy_path),
+         f'{VIDEOGEN_REMOTE}:{VIDEOGEN_INBOX}/{name}.npy.partial'],
+        label='rsync npy')
+    _run_net_with_retries(
+        ['ssh', VIDEOGEN_REMOTE, 'mv',
+         f'{VIDEOGEN_INBOX}/{name}.npy.partial',
+         f'{VIDEOGEN_INBOX}/{name}.npy'],
+        label='ssh mv')
     print(f'videogen submitted: {name} (N={actions_NT7.shape[0]}, T={T}) -> '
           f'{VIDEOGEN_REMOTE}:{VIDEOGEN_OUTPUTS}/{name}/*.mp4')
 
@@ -156,12 +178,11 @@ def fetch_videogen(name, dest_dir):
     """rsync the cv16 output subdir for <name> into dest_dir/<name>/."""
     local = dest_dir / name
     local.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
+    _run_net_with_retries(
         ['rsync', '-a',
          f'{VIDEOGEN_REMOTE}:{VIDEOGEN_OUTPUTS}/{name}/',
          f'{local}/'],
-        check=True,
-    )
+        label='rsync fetch')
     print(f'videogen fetched: {name} -> {local}')
 
 
@@ -490,6 +511,12 @@ def make_recording_wrapper(grab_fn, stop_fn, video_path, fps):
               help='Hard ceiling on how long to wait per cycle for cv16. '
                    'Exceeding this raises and the rollout crashes (after '
                    'holding pose).')
+@click.option('--videogen-hz', type=click.Choice(['15', '30']), default='30',
+              help='Trajectory rate sent to the cv16 video model. 15 (default) '
+                   'sends the policy\'s native 15Hz waypoints (first 33 of 32, '
+                   'last padded). 30 linearly upsamples to 30Hz (matches the '
+                   'video model\'s training rate) and sends the first 33 '
+                   'samples (~1.1s of horizon).')
 @click.option('--output-prefix', default='', type=str,
               help='Optional string prepended to the run directory name. '
                    'Stays in front even after the success/failure label is '
@@ -512,7 +539,7 @@ def main(ckpt_path, server_host, server_port,
          max_joint_speed, start_pose_ramp_sec, picked_up, settle_sec,
          dry_run, record, record_jpeg_quality, video_fps, log_settle_err,
          max_steps,
-         videogen, videogen_poll_sec, videogen_timeout_sec,
+         videogen, videogen_poll_sec, videogen_timeout_sec, videogen_hz,
          output_prefix, seed):
     if num_samples < 1:
         raise click.BadParameter('--num-samples must be >= 1')
@@ -810,12 +837,30 @@ def main(ckpt_path, server_host, server_port,
             winner_idx = 0
             if videogen:
                 raw_bgr = get_raw_bgr()
-                # actions_full_all: (N, 32, 7). Pad along time to T=33 by
-                # repeating each sample's last action once (T must be 4n+1
-                # and <= 33 per server contract; 33 = 4*8+1).
-                full_NT7 = np.concatenate(
-                    [actions_full_all, actions_full_all[:, -1:, :]],
-                    axis=1)                                         # (N, 33, 7)
+                if videogen_hz == '15':
+                    # actions_full_all: (N, 32, 7) at 15Hz (policy rate). Pad
+                    # along time to T=33 by repeating each sample's last
+                    # action once (T must be 4n+1 and <= 33 per server
+                    # contract; 33 = 4*8+1).
+                    full_NT7 = np.concatenate(
+                        [actions_full_all, actions_full_all[:, -1:, :]],
+                        axis=1)                                     # (N, 33, 7)
+                else:  # '30'
+                    # The video model was trained at 30Hz, so its expected
+                    # per-step delta is ~2x smaller than the policy's 15Hz
+                    # output. Linearly upsample to 64 points at 30Hz (even
+                    # indices = original; odd indices = midpoints), then send
+                    # the first 33 (= 4*8+1, the server's 4n+1 cap). Covers
+                    # the first ~1.1s of the horizon, in-distribution for the
+                    # video model.
+                    N_s, T_orig, D = actions_full_all.shape
+                    full_30hz = np.empty((N_s, 2 * T_orig, D),
+                                         dtype=actions_full_all.dtype)
+                    full_30hz[:, 0::2, :] = actions_full_all
+                    full_30hz[:, 1:-1:2, :] = 0.5 * (
+                        actions_full_all[:, :-1, :] + actions_full_all[:, 1:, :])
+                    full_30hz[:, -1, :] = actions_full_all[:, -1, :]
+                    full_NT7 = full_30hz[:, :33, :]                 # (N, 33, 7)
                 name = f'{run_stamp}_{cycle:06d}'
                 scratch = (record_dir / 'videogen') if record_dir is not None \
                           else pathlib.Path('/tmp')
@@ -836,34 +881,6 @@ def main(ckpt_path, server_host, server_port,
                 print(f'cycle {cycle}: VLM winner_idx={winner_idx} '
                       f'(votes={ranking.get("votes")}, '
                       f'tied={ranking.get("tied_indices")})')
-
-                """
-                Variant: 30 hz interpolation:
-                raw_bgr = get_raw_bgr()
-                # actions_full_all: (N, 32, 7) at 15Hz (policy rate). The
-                # video model was trained at 30Hz, so its expected per-step
-                # delta is ~2x smaller. Linearly upsample to 64 points at
-                # 30Hz (even indices = original; odd indices = midpoints),
-                # then send the first 33 (= 4*8+1, the server's 4n+1 cap).
-                # Covers the first ~1.1s of the horizon, in-distribution
-                # for the video model.
-                N_s, T_orig, D = actions_full_all.shape
-                full_30hz = np.empty((N_s, 2 * T_orig, D),
-                                     dtype=actions_full_all.dtype)
-                full_30hz[:, 0::2, :] = actions_full_all
-                full_30hz[:, 1:-1:2, :] = 0.5 * (
-                    actions_full_all[:, :-1, :] + actions_full_all[:, 1:, :])
-                full_30hz[:, -1, :] = actions_full_all[:, -1, :]
-                full_NT7 = full_30hz[:, :33, :]                     # (N, 33, 7)
-                name = f'{run_stamp}_{cycle:06d}'
-                scratch = (record_dir / 'videogen') if record_dir is not None \
-                          else pathlib.Path('/tmp')
-                scratch.mkdir(parents=True, exist_ok=True)
-                submit_videogen(name, raw_bgr, full_NT7, scratch)
-                wait_for_videogen(name, num_samples,
-                                  videogen_poll_sec, videogen_timeout_sec)
-                fetch_videogen(name, scratch)
-                """
 
             # ---- 7. Schedule the entire chunk back-to-back, starting now ----
             # Under --videogen, winner_idx is the VLM-chosen sample. Otherwise
