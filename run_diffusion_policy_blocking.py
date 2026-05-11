@@ -24,8 +24,8 @@ Terminal 2: inference (robodiff env)
 cd /home/cvlabusers/Appaji/diffusion_policy
 conda activate jgdrobodiff
 python run_diffusion_policy_blocking.py \
--i /home/cvlabusers/Appaji/diffusion_policy/data/jgd/2026.05.06/23.17.10_train_diffusion_unet_hybrid_pnp_lego_image/checkpoints/epoch=0200-train_loss=0.0116.ckpt --videogen
- --num-samples 4 --picked-up
+-i /home/cvlabusers/Appaji/diffusion_policy/data/jgd/2026.05.06/23.17.10_train_diffusion_unet_hybrid_pnp_lego_image/checkpoints/epoch=0200-train_loss=0.0116.ckpt \
+--output-prefix 0 --picked-up
 """
 import sys
 sys.stdout = open(sys.stdout.fileno(), mode='w', buffering=1)
@@ -427,6 +427,56 @@ def make_recording_wrapper(grab_fn, stop_fn, video_path, fps):
     return grab, stop
 
 
+# Per-joint diversity weights for the 7-DOF i2rt arm. Joints 0-5 are arm DOFs
+# and contribute fully; joint 6 is the gripper, which the diffusion policy
+# tends to predict noisily across samples. Without downweighting, two
+# trajectories differing only in gripper jitter could outrank trajectories
+# with genuinely distinct arm motion. Squared values are the per-DOF
+# variance weights; sqrt is applied before flattening so the L2 squares it
+# back to the intended weight.
+JOINT_WEIGHTS_FOR_DIVERSITY = np.array(
+    [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.1], dtype=np.float32
+)
+
+
+def select_diverse_indices(actions_exec, k, terminal_weight=4.0, n_terminal=2,
+                           joint_weights=JOINT_WEIGHTS_FOR_DIVERSITY,
+                           seed_idx=0):
+    """Greedy farthest-point sampling over weighted flattened L2.
+
+    actions_exec: (M, n_act_exec, action_dim) — executed window only. The
+        predicted-but-discarded tail past n_act_exec must NOT be included:
+        it never runs, so it cannot constitute "different futures."
+    k: number of indices to keep (must satisfy 1 <= k <= M).
+    terminal_weight, n_terminal: extra weight on the last n_terminal
+        timesteps. The last waypoint defines where the robot ends this
+        cycle, so it dominates the metric.
+    joint_weights: (action_dim,) per-joint weights — gripper downweighted
+        in the default to suppress its noisy contribution.
+    seed_idx: index of the first selected sample. Keeping seed_idx=0 means
+        sample 0 is always returned first, so callers using winner_idx=0
+        as the default executor are unaffected.
+    """
+    M, T, D = actions_exec.shape
+    assert 1 <= k <= M, f'k={k} must be in [1, M={M}]'
+    assert joint_weights.shape == (D,), f'joint_weights shape {joint_weights.shape} != ({D},)'
+    w_t = np.ones(T, dtype=actions_exec.dtype)
+    w_t[-n_terminal:] = terminal_weight
+    w = (np.sqrt(w_t)[:, None]
+         * np.sqrt(joint_weights.astype(actions_exec.dtype))[None, :])  # (T, D)
+    flat = (actions_exec * w[None, :, :]).reshape(M, -1)                # (M, T*D)
+    selected = [seed_idx]
+    min_d = np.linalg.norm(flat - flat[seed_idx], axis=1)
+    min_d[seed_idx] = -np.inf
+    for _ in range(k - 1):
+        nxt = int(np.argmax(min_d))
+        selected.append(nxt)
+        d_new = np.linalg.norm(flat - flat[nxt], axis=1)
+        min_d = np.minimum(min_d, d_new)
+        min_d[nxt] = -np.inf
+    return selected
+
+
 @click.command()
 @click.option('-i', '--input', 'ckpt_path', required=True, help='Path to .ckpt file')
 @click.option('--server-host', default='127.0.0.1', help='Follower portal host')
@@ -454,6 +504,13 @@ def make_recording_wrapper(grab_fn, stop_fn, video_path, fps):
                    'in a single forward pass; each sample uses an independent '
                    'noise init so the chunks differ. Sample 0 drives the robot; '
                    'all samples are saved when --record is set.')
+@click.option('--oversample', default=50, type=int,
+              help='Sample this many candidates per cycle, then prune to '
+                   '--num-samples via greedy farthest-point sampling on '
+                   'terminal-weighted joint-space L2 over the executed window. '
+                   'Set equal to --num-samples to disable diversity pruning. '
+                   'Sample 0 of the oversample batch is always kept first so '
+                   'the existing winner_idx=0 default still drives the robot.')
 @click.option('--scheduler', type=click.Choice(['keep', 'ddpm', 'ddim']),
               default='ddim',
               help="Inference scheduler. 'ddim' (default) rebuilds a DDIM "
@@ -535,7 +592,7 @@ def make_recording_wrapper(grab_fn, stop_fn, video_path, fps):
 def main(ckpt_path, server_host, server_port,
          frame_source, frame_host, frame_port,
          frequency, rs_width, rs_height, rs_fps,
-         device, num_inference_steps, n_act_exec, scheduler, num_samples,
+         device, num_inference_steps, n_act_exec, scheduler, num_samples, oversample,
          max_joint_speed, start_pose_ramp_sec, picked_up, settle_sec,
          dry_run, record, record_jpeg_quality, video_fps, log_settle_err,
          max_steps,
@@ -543,6 +600,9 @@ def main(ckpt_path, server_host, server_port,
          output_prefix, seed):
     if num_samples < 1:
         raise click.BadParameter('--num-samples must be >= 1')
+    if oversample < num_samples:
+        raise click.BadParameter(
+            f'--oversample ({oversample}) must be >= --num-samples ({num_samples})')
     if n_act_exec < 0:
         raise click.BadParameter('--n-act-exec must be >= 0 (0 = use full chunk)')
     if videogen and frame_source != 'local':
@@ -708,8 +768,9 @@ def main(ckpt_path, server_host, server_port,
 
     # 4. Policy warm-up — burn JIT/CUDA-init cost on a dummy obs.
     # Use the same batch size as the real loop so the warm-up covers the
-    # CUDA allocator state we will hit during inference.
-    print(f'Warming up policy inference (batch={num_samples})')
+    # CUDA allocator state we will hit during inference. Real batch is
+    # `oversample` (we sample that many candidates, then prune to num_samples).
+    print(f'Warming up policy inference (batch={oversample})')
     f_warm = grab()
     q_warm = client.get_joint_pos().result().astype(np.float32)
     # Use a separate seed for warm-up so it doesn't consume the per-cycle
@@ -722,19 +783,19 @@ def main(ckpt_path, server_host, server_port,
             policy.reset()
         img_warm = np.broadcast_to(
             np.stack([f_warm] * n_obs, axis=0)[None, ...],
-            (num_samples, n_obs, *f_warm.shape),
+            (oversample, n_obs, *f_warm.shape),
         ).copy()
         warm_obs = {'image': torch.from_numpy(img_warm).to(device_t)}
         if use_state:
             st_warm = np.broadcast_to(
                 np.stack([q_warm] * n_obs, axis=0)[None, ...],
-                (num_samples, n_obs, q_warm.shape[0]),
+                (oversample, n_obs, q_warm.shape[0]),
             ).copy()
             warm_obs['state'] = torch.from_numpy(st_warm).to(device_t)
         _ = policy.predict_action(warm_obs)
 
     print(f'Starting blocking policy loop. n_obs={n_obs}, n_act={n_act}, '
-          f'num_samples={num_samples}, dt={dt:.4f}s, '
+          f'oversample={oversample}, num_samples={num_samples}, dt={dt:.4f}s, '
           f'chunk duration={n_act * dt:.2f}s. '
           f'Ctrl+C to stop and hold pose.{" (DRY RUN — no commands sent)" if dry_run else ""}')
 
@@ -763,29 +824,31 @@ def main(ckpt_path, server_host, server_port,
             # ---- 5. Capture one fresh observation (most recent image + state) ----
             # If the policy expects n_obs > 1, tile the same most-recent obs to
             # match the expected shape (we do not maintain any history here).
-            # We then tile the obs along the batch dim by num_samples so a
-            # single forward pass produces num_samples independent action
+            # We then tile the obs along the batch dim by `oversample` so a
+            # single forward pass produces `oversample` independent action
             # chunks (each draws its own noise init in conditional_sample).
+            # The set is pruned to `num_samples` after inference via greedy
+            # FPS on terminal-weighted joint-space L2 (see select_diverse_indices).
             f = grab()
             save_obs(f)
             obs_img_one = np.stack([f] * n_obs, axis=0)[None, ...]      # (1, n_obs, 3, 360, 640)
             obs_img_np = np.broadcast_to(
                 obs_img_one,
-                (num_samples, *obs_img_one.shape[1:]),
-            ).copy()                                                     # (N, n_obs, 3, 360, 640)
+                (oversample, *obs_img_one.shape[1:]),
+            ).copy()                                                     # (M, n_obs, 3, 360, 640)
             if use_state:
                 q = client.get_joint_pos().result().astype(np.float32)
                 obs_state_one = np.stack([q] * n_obs, axis=0)[None, ...]  # (1, n_obs, 7)
                 obs_state_np = np.broadcast_to(
                     obs_state_one,
-                    (num_samples, *obs_state_one.shape[1:]),
-                ).copy()                                                  # (N, n_obs, 7)
+                    (oversample, *obs_state_one.shape[1:]),
+                ).copy()                                                  # (M, n_obs, 7)
 
-            # ---- 6. Inference (batched: one forward pass -> N samples) ----
-            # Re-seed per cycle so the N noise inits at cycle k are reproducible
+            # ---- 6. Inference (batched: one forward pass -> M samples) ----
+            # Re-seed per cycle so the M noise inits at cycle k are reproducible
             # across runs (run-A's i-th sample == run-B's i-th sample at the
-            # same cycle, given identical obs). The N samples within this call
-            # are still diverse: they are N consecutive draws from one randn.
+            # same cycle, given identical obs). The M samples within this call
+            # are still diverse: they are M consecutive draws from one randn.
             cycle_seed = seed + cycle
             torch.manual_seed(cycle_seed)
             if torch.cuda.is_available():
@@ -798,14 +861,39 @@ def main(ckpt_path, server_host, server_port,
                 if use_state:
                     obs_t['state'] = torch.from_numpy(obs_state_np).to(device_t)
                 pred = policy.predict_action(obs_t)
-            actions_all = pred['action'].cpu().numpy()  # (N, n_act, 7)
+            actions_all = pred['action'].cpu().numpy()  # (M, n_act, 7)
             # Full unsliced horizon prediction from the policy (e.g. 32),
             # before the n_action_steps window is applied. Same shape across
             # samples; first n_act of axis=1 overlap with actions_all.
-            actions_full_all = pred['action_pred'].cpu().numpy()  # (N, horizon, 7)
+            actions_full_all = pred['action_pred'].cpu().numpy()  # (M, horizon, 7)
             inference_latency = time.time() - t_inf_start
 
-            # Persist the full (N, n_act, 7) tensor for offline analysis.
+            # ---- 6a. Prune to num_samples via greedy FPS on the EXECUTED
+            # window only. The tail past n_act_exec is predicted-but-discarded
+            # and would only add noise to the diversity metric. seed_idx=0
+            # ensures sample 0 of the oversample batch is kept first, so the
+            # winner_idx=0 default downstream still drives the robot.
+            keep = list(range(actions_all.shape[0]))
+            if oversample > num_samples:
+                actions_exec = actions_all[:, :n_act_exec]   # (M, n_act_exec, 7)
+                keep = select_diverse_indices(
+                    actions_exec, k=num_samples,
+                    terminal_weight=4.0, n_terminal=2,
+                    joint_weights=JOINT_WEIGHTS_FOR_DIVERSITY,
+                    seed_idx=0,
+                )
+                # Persist pre-prune diagnostics before reslicing.
+                if record_dir is not None:
+                    np.save(record_dir / f'actions_full_pre_{cycle:06d}.npy',
+                            actions_full_all)
+                    np.save(record_dir / f'keep_indices_{cycle:06d}.npy',
+                            np.asarray(keep, dtype=np.int32))
+                actions_all = actions_all[keep]              # (num_samples, n_act, 7)
+                actions_full_all = actions_full_all[keep]    # (num_samples, horizon, 7)
+                print(f'cycle {cycle}: oversampled {oversample}, '
+                      f'kept indices {keep}')
+
+            # Persist the kept (post-prune) tensors for offline analysis.
             if record_dir is not None:
                 np.save(record_dir / f'actions_{cycle:06d}.npy', actions_all)
                 np.save(record_dir / f'actions_full_{cycle:06d}.npy', actions_full_all)
@@ -815,19 +903,7 @@ def main(ckpt_path, server_host, server_port,
             # reported per-timestep so we can see how sample disagreement
             # evolves through the chunk (typically small near t=0 where the
             # chunk is conditioned on the obs, larger near t=n_act-1).
-            sample_std = actions_all.std(axis=0)                    # (n_act, 7)
-            stat_mean = actions_all.mean(axis=(0, 1))               # (7,)
-            stat_min = actions_all.min(axis=(0, 1))                 # (7,)
-            stat_max = actions_all.max(axis=(0, 1))                 # (7,)
-            fmt = lambda v: '[' + ' '.join(f'{x:+.4f}' for x in v) + ']'
-            print(f'cycle {cycle}: stats over {num_samples} samples (per-DOF):')
-            print(f'  mean = {fmt(stat_mean)}')
-            print(f'  min  = {fmt(stat_min)}')
-            print(f'  max  = {fmt(stat_max)}')
-            print(f'  std across {num_samples} samples, shape '
-                  f'(n_act={sample_std.shape[0]}, 7):')
-            for t in range(sample_std.shape[0]):
-                print(f'    t={t:2d}: {fmt(sample_std[t])}')
+            print(f'cycle {cycle}; {num_samples} samples (per-DOF):')
 
             # ---- 6b. Submit to cv16 video-gen and BLOCK on completion ----
             # Robot stays paused at the previous chunk's last waypoint until
