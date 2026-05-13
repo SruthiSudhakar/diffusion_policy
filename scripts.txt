@@ -4,19 +4,6 @@ python scripts_pnp_lego/convert_pnp_to_zarr.py \
 --dst data/pnp_red_lego_to_brown_bowl/replay_200ex.zarr \
 --image-size 640 360 --subsample 3 --success-only
 
-python scripts_pnp_lego/convert_pnp_to_zarr.py \
---src /proj/vondrick3/datasets/VLMjgd/PnPRedLegoToBrownBowl \
---dst data/pnp_red_lego_to_brown_bowl/replay_1_200_with_state_15hz.zarr \
---image-size 640 360 --success-only \
---episode-min 1 --episode-max 200
-
-python scripts_pnp_lego/convert_pnp_to_zarr.py \
---src /proj/vondrick3/datasets/VLMjgd/PnPRedLegoToBrownBowl \
---dst data/pnp_red_lego_to_brown_bowl/replay_201_300_with_state.zarr \
---image-size 640 360 --success-only \
---episode-min 201 --episode-max 300
-
-
 2. Training:
 With Image+State:
 cd /proj/vondrick3/sruthi/Appaji/diffusion_policy
@@ -27,28 +14,47 @@ accelerate launch --config_file accelerate_config.yaml --num_processes 8 \
 train.py --config-dir=. \
 --config-name=pnp_lego_image_diffusion_policy_cnn.yaml \
 training.seed=42 \
-task.dataset_path=data/pnp_red_lego_to_brown_bowl/replay_201_300_with_state.zarr \
-task.dataset.zarr_path=data/pnp_red_lego_to_brown_bowl/replay_201_300_with_state.zarr \
+task.dataset_path=data/pnp_red_lego_to_brown_bowl/replay_200ex.zarr \
+task.dataset.zarr_path=data/pnp_red_lego_to_brown_bowl/replay_200ex.zarr \
 'hydra.run.dir=data/jgd/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}'
 
+3.Differences Notes:
+
+4. Claude Todos
+
+5. Important Claude Sessions:
+
+6. UprightBottle (2 cameras, leader_trajectory):
+One-time data conversion:
+python scripts_upright_bottle/convert_upright_bottle_to_zarr.py \
+--src /proj/vondrick3/datasets/expert_data_jgd_UprightBottle \
+--dst data/upright_bottle/replay.zarr \
+--image-size 640 360 --subsample 3 --success-only
+
+Training (Image1 + Image2 + State):
+cd /proj/vondrick3/sruthi/Appaji/diffusion_policy
+conda activate jgdrobodiff
 cv12
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 OMP_NUM_THREADS=4 TOKENIZERS_PARALLELISM=false \
 accelerate launch --config_file accelerate_config.yaml --num_processes 8 \
 train.py --config-dir=. \
---config-name=pnp_lego_image_diffusion_policy_cnn.yaml \
+--config-name=upright_bottle_image_diffusion_policy_cnn.yaml \
 training.seed=42 \
-task.dataset_path=data/pnp_red_lego_to_brown_bowl/replay_1_200_with_state_15hz.zarr \
-task.dataset.zarr_path=data/pnp_red_lego_to_brown_bowl/replay_1_200_with_state_15hz.zarr \
+task.dataset_path=data/upright_bottle/replay.zarr \
+task.dataset.zarr_path=data/upright_bottle/replay.zarr \
 'hydra.run.dir=data/jgd/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}'
 
-With Just Image:
+Training (Image1 + Image2 only, no state):
+cd /proj/vondrick3/sruthi/Appaji/diffusion_policy
+conda activate jgdrobodiff
+cv11
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 OMP_NUM_THREADS=4 TOKENIZERS_PARALLELISM=false \
 accelerate launch --config_file accelerate_config.yaml --num_processes 8 \
 train.py --config-dir=. \
---config-name=pnp_lego_image_only_diffusion_policy_cnn.yaml \
+--config-name=upright_bottle_image_only_diffusion_policy_cnn.yaml \
 training.seed=42 \
-task.dataset_path=data/pnp_red_lego_to_brown_bowl/replay_201_300_with_state.zarr \
-task.dataset.zarr_path=data/pnp_red_lego_to_brown_bowl/replay_201_300_with_state.zarr \
+task.dataset_path=data/upright_bottle/replay.zarr \
+task.dataset.zarr_path=data/upright_bottle/replay.zarr \
 'hydra.run.dir=data/jgd/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}'
 
 
