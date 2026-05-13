@@ -60,3 +60,4 @@ task.dataset.zarr_path=data/pnp_red_lego_to_brown_bowl/replay_201_300_with_state
 
 5. Important Claude Sessions:
 1. crosair: claude --resume 62465746-4c81-4cee-91e8-73f3a24dd39e - robot setup
+2. crosait: claude --resume 4f60917d-5445-4474-867f-19f2f1a11ca4 - understanding diffusion policy
