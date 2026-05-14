@@ -37,7 +37,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--rs-height", type=int, default=720)
     ap.add_argument("--rs-fps", type=int, default=30)
     ap.add_argument("--alpha", type=float, default=0.5, help="Initial blend weight on reference (0..1).")
-    ap.add_argument("--serial", default=None, help="RealSense serial; default = first connected device.")
+    ap.add_argument("--serial", default="317222070925", help="RealSense serial; default = camera 2 (317222070925).")
     return ap.parse_args()
 
 

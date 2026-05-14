@@ -25,13 +25,40 @@ python examples/minimum_gello/minimum_gello.py --gripper linear_4310 --mode foll
 Terminal 2: inference (robodiff env)
 cd /home/cvlabusers/Appaji/diffusion_policy
 conda activate robodiff
-python run_diffusion_policy_blocking_upright_bottle.py -i /home/cvlabusers/Appaji/diffusion_policy/data/jgd/2026.05.12/18.36.37_train_diffusion_unet_hybrid_upright_bottle_image/checkpoints/epoch=0250-train_loss=0.0160.ckpt
+
+collecting failure+success pairs
+python run_diffusion_policy_blocking_upright_bottle.py \
+-i /home/cvlabusers/Appaji/diffusion_policy/data/jgd/2026.05.12/21.18.14_train_diffusion_unet_hybrid_upright_bottle_image_only/checkpoints/epoch=0200-train_loss=0.0270.ckpt \
+--output-prefix 0 \
+--seed $(date +%s) \
+--max-steps 64
+
+running:
+python run_diffusion_policy_blocking_upright_bottle.py \
+-i /home/cvlabusers/Appaji/diffusion_policy/data/jgd/2026.05.12/21.18.14_train_diffusion_unet_hybrid_upright_bottle_image_only/checkpoints/epoch=0200-train_loss=0.0270.ckpt \
+--output-prefix 11 \
+--videogen
+
+cup plate:
+python run_diffusion_policy_blocking_upright_bottle.py \
+-i /home/cvlabusers/Appaji/diffusion_policy/data/jgd/2026.05.14/10.44.35_train_diffusion_unet_hybrid_cup_plate_image_only/checkpoints/epoch=0250-train_loss=0.0238.ckpt \
+--output-prefix 1jgd \
+--videogen
+
+bag plate:
+
+python run_diffusion_policy_blocking_upright_bottle.py \
+-i /home/cvlabusers/Appaji/diffusion_policy/data/jgd/2026.05.14/15.07.10_train_diffusion_unet_hybrid_bag_plate_image_only/checkpoints/epoch=0250-train_loss=0.0288.ckpt \
+--pickup /home/cvlabusers/Appaji/i2rt/pickup_bag.npy \
+--output-prefix 1jgd \
+--videogen
 """
 import sys
 sys.stdout = open(sys.stdout.fileno(), mode='w', buffering=1)
 sys.stderr = open(sys.stderr.fileno(), mode='w', buffering=1)
 
 import datetime
+import json
 import pathlib
 import shutil
 import subprocess
@@ -51,15 +78,28 @@ from diffusion_policy.workspace.base_workspace import BaseWorkspace
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 
+VIDEOGEN_REMOTE = "sruthi@cv16.cs.columbia.edu"
+VIDEOGEN_INBOX = "/proj/vondrick3/HunyuanVideo-1.5-train-sruthi/new_requests"
+VIDEOGEN_OUTPUTS = "/proj/vondrick3/HunyuanVideo-1.5-train-sruthi/outputs/generated_videos"
+VIDEOGEN_T = 33  # server's --video_length
+
 # RealSense serials. Mapping is fixed by training-time data collection:
 # image1 was collected from cam0, image2 from cam1.
 # See scripts_upright_bottle/convert_upright_bottle_to_zarr.py (line 142-143).
+# Only cam1 (image2) is sent to the video-gen server; the policy still consumes
+# both image1 + image2 + state as usual.
 CAM0_SERIAL = "243522073909"   # -> obs key 'image1'
-CAM1_SERIAL = "317222070925"   # -> obs key 'image2'
+CAM1_SERIAL = "317222070925"   # -> obs key 'image2' (also the videogen image)
 
 
 def make_local_grab(serial, rs_width, rs_height, rs_fps):
-    """Open one RealSense by serial and return grab() -> (3,360,640) float32 RGB in [0,1]."""
+    """Open one RealSense by serial and return (grab, stop, get_raw_bgr).
+
+    grab() -> (3,360,640) float32 RGB in [0,1] (policy obs).
+    get_raw_bgr() -> latest captured raw BGR uint8 at native rs_width x rs_height,
+    for downstream consumers (e.g. video-gen submission). Raises if no frame
+    has been captured yet.
+    """
     import pyrealsense2 as rs  # imported here so cv12 doesn't need it
     print(f'Opening RealSense color stream (serial={serial}): {rs_width}x{rs_height} @ {rs_fps} BGR8')
     pipe = rs.pipeline()
@@ -68,14 +108,177 @@ def make_local_grab(serial, rs_width, rs_height, rs_fps):
     rs_cfg.enable_stream(rs.stream.color, rs_width, rs_height, rs.format.bgr8, rs_fps)
     pipe.start(rs_cfg)
 
+    raw_state = {'bgr': None}
+    raw_lock = threading.Lock()
+
     def grab():
         frames = pipe.wait_for_frames()
         bgr = np.asanyarray(frames.get_color_frame().get_data())
+        with raw_lock:
+            raw_state['bgr'] = bgr.copy()
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         rgb = cv2.resize(rgb, (640, 360), interpolation=cv2.INTER_AREA)
         return (rgb.astype(np.float32) / 255.0).transpose(2, 0, 1)
 
-    return grab, pipe.stop
+    def get_raw_bgr():
+        with raw_lock:
+            b = raw_state['bgr']
+        if b is None:
+            raise RuntimeError('get_raw_bgr() called before any frame captured')
+        return b.copy()
+
+    return grab, pipe.stop, get_raw_bgr
+
+
+def _run_net_with_retries(cmd, *, attempts=5, base_delay=2.0, label=None):
+    """subprocess.run(check=True) with exponential backoff for transient
+    ssh/rsync failures. Reraises after the final attempt.
+    """
+    label = label or cmd[0]
+    for i in range(1, attempts + 1):
+        try:
+            subprocess.run(cmd, check=True)
+            return
+        except subprocess.CalledProcessError as e:
+            if i == attempts:
+                raise
+            delay = base_delay * (2 ** (i - 1))
+            print(f'{label} attempt {i}/{attempts} failed (exit {e.returncode}); '
+                  f'retrying in {delay:.1f}s')
+            time.sleep(delay)
+
+
+def submit_videogen(name, image_bgr, actions_NT7, scratch_dir):
+    """rsync (image, manifest) to cv16 inbox with atomic .partial -> .npy rename.
+
+    actions_NT7 has shape (N, T, 7). Server accepts a 3-D trajectory and
+    produces N mp4s per request. Only one image is sent (image2 / cam1).
+    """
+    img_path = scratch_dir / f'{name}.jpg'
+    cv2.imwrite(str(img_path), image_bgr,
+                [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+    T = actions_NT7.shape[1]
+    manifest = {
+        'image_paths': np.array([f'{name}.jpg'] * T),
+        'trajectory': actions_NT7.astype(np.float64),
+    }
+    npy_path = scratch_dir / f'{name}.npy'
+    np.save(npy_path, manifest, allow_pickle=True)
+    _run_net_with_retries(
+        ['rsync', str(img_path),
+         f'{VIDEOGEN_REMOTE}:{VIDEOGEN_INBOX}/{name}.jpg'],
+        label='rsync img')
+    _run_net_with_retries(
+        ['rsync', str(npy_path),
+         f'{VIDEOGEN_REMOTE}:{VIDEOGEN_INBOX}/{name}.npy.partial'],
+        label='rsync npy')
+    _run_net_with_retries(
+        ['ssh', VIDEOGEN_REMOTE, 'mv',
+         f'{VIDEOGEN_INBOX}/{name}.npy.partial',
+         f'{VIDEOGEN_INBOX}/{name}.npy'],
+        label='ssh mv')
+    print(f'videogen submitted: {name} (N={actions_NT7.shape[0]}, T={T}) -> '
+          f'{VIDEOGEN_REMOTE}:{VIDEOGEN_OUTPUTS}/{name}/*.mp4')
+
+
+def fetch_videogen(name, dest_dir):
+    """rsync the cv16 output subdir for <name> into dest_dir/<name>/."""
+    local = dest_dir / name
+    local.mkdir(parents=True, exist_ok=True)
+    _run_net_with_retries(
+        ['rsync', '-a',
+         f'{VIDEOGEN_REMOTE}:{VIDEOGEN_OUTPUTS}/{name}/',
+         f'{local}/'],
+        label='rsync fetch')
+    print(f'videogen fetched: {name} -> {local}')
+
+
+def wait_for_videogen(name, expected_count, poll_sec, timeout_sec):
+    """Block until cv16 has produced >= expected_count mp4s in
+    <VIDEOGEN_OUTPUTS>/<name>/."""
+    out_dir = f'{VIDEOGEN_OUTPUTS}/{name}'
+    pattern = f'{out_dir}/*.mp4'
+    deadline = time.time() + timeout_sec
+    t0 = time.time()
+    last_count = -1
+    while time.time() < deadline:
+        result = subprocess.run(
+            ['ssh', VIDEOGEN_REMOTE,
+             f'ls -1 {pattern} 2>/dev/null | wc -l'],
+            capture_output=True, text=True,
+        )
+        try:
+            count = int(result.stdout.strip() or '0')
+        except ValueError:
+            count = 0
+        if count != last_count:
+            print(f'videogen waiting: {name} {count}/{expected_count} '
+                  f'(elapsed {time.time() - t0:.1f}s)')
+            last_count = count
+        if count >= expected_count:
+            print(f'videogen ready: {name} (waited {time.time() - t0:.1f}s)')
+            return
+        time.sleep(poll_sec)
+    raise RuntimeError(
+        f'videogen timeout after {timeout_sec}s waiting for {expected_count} '
+        f'mp4s matching {pattern} (last count={last_count})')
+
+
+def wait_for_ranking(name, poll_sec, timeout_sec):
+    """Block until cv16 has produced ranking.json in
+    <VIDEOGEN_OUTPUTS>/<name>/."""
+    out_dir = f'{VIDEOGEN_OUTPUTS}/{name}'
+    target = f'{out_dir}/ranking.json'
+    deadline = time.time() + timeout_sec
+    t0 = time.time()
+    last_present = None
+    while time.time() < deadline:
+        result = subprocess.run(
+            ['ssh', VIDEOGEN_REMOTE,
+             f'test -f {target} && echo ok || echo missing'],
+            capture_output=True, text=True,
+        )
+        present = result.stdout.strip() == 'ok'
+        if present != last_present:
+            print(f'ranking waiting: {name} '
+                  f'{"present" if present else "missing"} '
+                  f'(elapsed {time.time() - t0:.1f}s)')
+            last_present = present
+        if present:
+            print(f'ranking ready: {name} (waited {time.time() - t0:.1f}s)')
+            return
+        time.sleep(poll_sec)
+    raise RuntimeError(
+        f'ranking timeout after {timeout_sec}s waiting for {target}')
+
+
+JOINT_WEIGHTS_FOR_DIVERSITY = np.array(
+    [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.1], dtype=np.float32
+)
+
+
+def select_diverse_indices(actions_exec, k, terminal_weight=4.0, n_terminal=2,
+                           joint_weights=JOINT_WEIGHTS_FOR_DIVERSITY,
+                           seed_idx=0):
+    """Greedy farthest-point sampling over weighted flattened L2."""
+    M, T, D = actions_exec.shape
+    assert 1 <= k <= M, f'k={k} must be in [1, M={M}]'
+    assert joint_weights.shape == (D,), f'joint_weights shape {joint_weights.shape} != ({D},)'
+    w_t = np.ones(T, dtype=actions_exec.dtype)
+    w_t[-n_terminal:] = terminal_weight
+    w = (np.sqrt(w_t)[:, None]
+         * np.sqrt(joint_weights.astype(actions_exec.dtype))[None, :])
+    flat = (actions_exec * w[None, :, :]).reshape(M, -1)
+    selected = [seed_idx]
+    min_d = np.linalg.norm(flat - flat[seed_idx], axis=1)
+    min_d[seed_idx] = -np.inf
+    for _ in range(k - 1):
+        nxt = int(np.argmax(min_d))
+        selected.append(nxt)
+        d_new = np.linalg.norm(flat - flat[nxt], axis=1)
+        min_d = np.minimum(min_d, d_new)
+        min_d[nxt] = -np.inf
+    return selected
 
 
 def make_recording_wrapper(grab_fn, stop_fn, video_path, fps):
@@ -211,9 +414,9 @@ def make_recording_wrapper(grab_fn, stop_fn, video_path, fps):
 @click.option('-i', '--input', 'ckpt_path', required=True, help='Path to .ckpt file')
 @click.option('--server-host', default='127.0.0.1', help='Follower portal host')
 @click.option('--server-port', default=11333, type=int, help='Follower portal port')
-@click.option('--frequency', default=15.0, type=float,
+@click.option('--frequency', default=10, type=float,
               help='Action rate in Hz. Spacing dt between consecutive scheduled '
-                   'waypoints. Must match training (15).')
+                   'waypoints. Must match training or be lower.')
 @click.option('--rs-width', default=1280, type=int)
 @click.option('--rs-height', default=720, type=int)
 @click.option('--rs-fps', default=30, type=int)
@@ -224,12 +427,20 @@ def make_recording_wrapper(grab_fn, stop_fn, video_path, fps):
               help='Number of actions to actually execute from each predicted '
                    'chunk of length n_action_steps (e.g. 16). 0 (default) means '
                    'execute the full chunk. Must be in [1, n_action_steps].')
-@click.option('--num-samples', default=5, type=int,
+@click.option('--num-samples', default=10, type=int,
               help='Number of action chunks to sample per observation. The same '
                    'obs is tiled along the batch dim and run through the policy '
                    'in a single forward pass; each sample uses an independent '
-                   'noise init so the chunks differ. Sample 0 drives the robot; '
+                   'noise init so the chunks differ. Sample 0 drives the robot '
+                   'unless --videogen overrides it with the VLM-chosen index; '
                    'all samples are saved when --record is set.')
+@click.option('--oversample', default=100, type=int,
+              help='Sample this many candidates per cycle, then prune to '
+                   '--num-samples via greedy farthest-point sampling on '
+                   'terminal-weighted joint-space L2 over the executed window. '
+                   '0 (default) disables oversampling (set equal to --num-samples). '
+                   'Useful with --videogen to feed the VLM ranker diverse chunks. '
+                   'Sample 0 of the oversample batch is always kept first.')
 @click.option('--scheduler', type=click.Choice(['keep', 'ddpm', 'ddim']),
               default='ddim',
               help="Inference scheduler. 'ddim' (default) rebuilds a DDIM "
@@ -239,6 +450,11 @@ def make_recording_wrapper(grab_fn, stop_fn, video_path, fps):
               help='Per-joint L_inf speed cap (rad/s) for the i2rt interpolator.')
 @click.option('--start-pose-ramp-sec', default=2.0, type=float,
               help='Wall-clock duration for the smooth ramp to start_pose at boot.')
+@click.option('--pickup', default=None, type=str,
+              help='Path to a .npy file of joint waypoints (shape [N, action_dim]). '
+                   'If set, these actions are executed back-to-back at the policy '
+                   'rate at boot in place of the fixed start_pose ramp, and the '
+                   'final pose becomes the starting pose for the rollout.')
 @click.option('--settle-sec', default=0.5, type=float,
               help='Extra wait after the last waypoint\'s target time before '
                    'capturing the next observation. Lets the interpolator '
@@ -261,21 +477,54 @@ def make_recording_wrapper(grab_fn, stop_fn, video_path, fps):
                    'the robot\'s actual position and the last scheduled action. '
                    'Use to tune --settle-sec / --max-joint-speed. Skipped under '
                    '--dry-run since no commands are sent.')
-@click.option('--max-steps', default=300, type=int,
+@click.option('--max-steps', default=96, type=int,
               help='Max total action waypoints scheduled to the robot before '
                    'the loop auto-stops (each cycle schedules n_act_exec). '
                    'Stop is also triggered by Ctrl+C. After either, the '
-                   'video is finalized and the user is prompted to label '
-                   'the rollout success/failure (used as a prefix on the '
-                   'run dir).')
+                   'video is finalized and the user is prompted for a free-'
+                   'text label that is injected into the run dir name '
+                   '(blank = no rename).')
+@click.option('--videogen/--no-videogen', default=False,
+              help='If set, every cycle submits (raw 1280x720 image2, all '
+                   '--num-samples full-horizon trajectories padded/upsampled '
+                   'to 33 frames) to the cv16 HunyuanVideo server and BLOCKS '
+                   'until the mp4s and ranking.json appear, then executes '
+                   'actions_all[winner_idx] (VLM-chosen chunk) instead of '
+                   'sample 0. Only image2 (cam1) is sent to the server; the '
+                   'policy still uses both image1 + image2 + state.')
+@click.option('--videogen-poll-sec', default=5.0, type=float,
+              help='How often to poll cv16 for the generated mp4s / ranking.json.')
+@click.option('--videogen-timeout-sec', default=1800.0, type=float,
+              help='Hard ceiling per cycle. Exceeding raises (after holding pose).')
+@click.option('--videogen-hz', type=click.Choice(['15', '30']), default='30',
+              help='Trajectory rate sent to the cv16 video model. 15 sends the '
+                   "policy's native 15Hz waypoints (32 padded to 33). 30 (default) "
+                   'linearly upsamples to 30Hz and sends the first 33 samples '
+                   '(matches the video model training rate, ~1.1s horizon).')
+@click.option('--seed', default=0, type=int,
+              help='Base RNG seed. At cycle k, torch.manual_seed(seed + k) is '
+                   'called before predict_action so the N noise inits are '
+                   'reproducible across runs with identical obs.')
+@click.option('--output-prefix', default='', type=str,
+              help='Optional string prepended to the run directory name. '
+                   'Stays in front even after the label is added '
+                   '(e.g. "exp1" -> "exp1_<run_stamp>" -> '
+                   '"exp1_<label>_<run_stamp>"). Default empty (no prefix).')
 def main(ckpt_path, server_host, server_port,
          frequency, rs_width, rs_height, rs_fps,
-         device, num_inference_steps, n_act_exec, scheduler, num_samples,
-         max_joint_speed, start_pose_ramp_sec, settle_sec,
+         device, num_inference_steps, n_act_exec, scheduler, num_samples, oversample,
+         max_joint_speed, start_pose_ramp_sec, pickup, settle_sec,
          dry_run, record, record_jpeg_quality, video_fps, log_settle_err,
-         max_steps):
+         max_steps,
+         videogen, videogen_poll_sec, videogen_timeout_sec, videogen_hz, seed,
+         output_prefix):
     if num_samples < 1:
         raise click.BadParameter('--num-samples must be >= 1')
+    if oversample == 0:
+        oversample = num_samples
+    if oversample < num_samples:
+        raise click.BadParameter(
+            f'--oversample ({oversample}) must be >= --num-samples ({num_samples})')
     if n_act_exec < 0:
         raise click.BadParameter('--n-act-exec must be >= 0 (0 = use full chunk)')
     # 1. Load checkpoint
@@ -291,6 +540,10 @@ def main(ckpt_path, server_host, server_port,
     device_t = torch.device(device)
     if device_t.type == 'cpu':
         print('WARNING: running on CPU. Each inference call will be very slow.')
+    # Reproducibility: deterministic cuDNN so identical noise init + obs ->
+    # identical actions across runs (no kernel-autotuning float drift).
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
     policy.to(device_t).eval()
     if hasattr(policy, 'num_inference_steps'):
         old_steps = policy.num_inference_steps
@@ -362,37 +615,92 @@ def main(ckpt_path, server_host, server_port,
             f'Follower DOF ({cur.shape[0]}) != policy action_dim ({policy.action_dim}). '
             'Check the follower\'s gripper config.')
 
-    # 2b. Move follower to the fixed start pose
-    start_pose = np.array([
-        -0.02651255, 1.53639277, 1.49328603, -1.66189822,
-        0.02994583, 0.05359731, 0.99420248,
-    ], dtype=np.float64)
-    if start_pose.shape[0] != policy.action_dim:
-        raise RuntimeError(
-            f'Start pose dim ({start_pose.shape[0]}) != policy action_dim ({policy.action_dim}).')
-    print(f'Moving follower to start pose over {start_pose_ramp_sec:.2f}s: {start_pose}')
-    client.clear_waypoints()
-    client.schedule_waypoint(
-        start_pose,
-        time.time() + start_pose_ramp_sec,
-        max_joint_speed,
-    )
-    time.sleep(start_pose_ramp_sec + 0.2)
-    print(f'Reached start pose: {client.get_joint_pos().result()}')
+    # 2b. Move follower to the starting pose: either replay a recorded pickup
+    # trajectory from --pickup <file.npy>, or ramp to the fixed start_pose.
+    if pickup is not None:
+        # Shim for .npy files saved with numpy 2.x being loaded under numpy 1.x:
+        # the pickle stream references `numpy._core`, which only exists in 2.x.
+        if not hasattr(np, '_core'):
+            import sys as _sys
+            import numpy.core as _np_core
+            _sys.modules.setdefault('numpy._core', _np_core)
+            for _sub in ('multiarray', 'umath', 'numeric', '_multiarray_umath'):
+                _full = f'numpy._core.{_sub}'
+                if _full not in _sys.modules:
+                    try:
+                        _sys.modules[_full] = __import__(f'numpy.core.{_sub}',
+                                                        fromlist=[_sub])
+                    except ImportError:
+                        pass
+        pickup_raw = np.load(pickup, allow_pickle=True)
+        # record_replay_trajectory saves a 0-d object array wrapping a dict
+        # with a 'trajectory' key; older callers may pass a raw (N, D) array.
+        if isinstance(pickup_raw, np.ndarray) and pickup_raw.dtype == object:
+            pickup_obj = pickup_raw.item()
+            if isinstance(pickup_obj, dict) and 'trajectory' in pickup_obj:
+                pickup_actions = np.asarray(pickup_obj['trajectory'], dtype=np.float64)
+            else:
+                raise RuntimeError(
+                    f'Pickup file {pickup} is an object array but does not '
+                    f'contain a "trajectory" key (got {type(pickup_obj).__name__}).')
+        else:
+            pickup_actions = np.asarray(pickup_raw, dtype=np.float64)
+        if pickup_actions.ndim != 2 or pickup_actions.shape[1] != policy.action_dim:
+            raise RuntimeError(
+                f'Pickup file {pickup} has shape {pickup_actions.shape}; expected '
+                f'(N, {policy.action_dim}).')
+        print(f'Replaying {pickup_actions.shape[0]} pickup waypoints from {pickup} '
+              f'at {1.0/dt:.2f}Hz')
+        client.clear_waypoints()
+        schedule_anchor = time.time()
+        pickup_ts = (np.arange(1, len(pickup_actions) + 1, dtype=np.float64) * dt
+                     + schedule_anchor)
+        for q_a, t_a in zip(pickup_actions, pickup_ts):
+            client.schedule_waypoint(q_a, float(t_a), max_joint_speed)
+        sleep_until = pickup_ts[-1] + settle_sec
+        remaining = sleep_until - time.time()
+        if remaining > 0:
+            time.sleep(remaining)
+        print(f'Reached pickup end pose: {client.get_joint_pos().result()}')
+    else:
+        start_pose = np.array([
+            -0.02651255, 1.53639277, 1.49328603, -1.66189822,
+            0.02994583, 0.05359731, 0.99420248,
+        ], dtype=np.float64)
+        if start_pose.shape[0] != policy.action_dim:
+            raise RuntimeError(
+                f'Start pose dim ({start_pose.shape[0]}) != policy action_dim ({policy.action_dim}).')
+        print(f'Moving follower to start pose over {start_pose_ramp_sec:.2f}s: {start_pose}')
+        client.clear_waypoints()
+        client.schedule_waypoint(
+            start_pose,
+            time.time() + start_pose_ramp_sec,
+            max_joint_speed,
+        )
+        time.sleep(start_pose_ramp_sec + 0.2)
+        print(f'Reached start pose: {client.get_joint_pos().result()}')
 
     # 3. Open both RealSense cameras (image1 <- cam0, image2 <- cam1).
-    grab1, stop1 = make_local_grab(CAM0_SERIAL, rs_width, rs_height, rs_fps)
-    grab2, stop2 = make_local_grab(CAM1_SERIAL, rs_width, rs_height, rs_fps)
+    # Only cam1's get_raw_bgr is used (image2 is what we send to the video-gen
+    # server). cam0's get_raw_bgr is captured but unused.
+    grab1, stop1, _ = make_local_grab(CAM0_SERIAL, rs_width, rs_height, rs_fps)
+    grab2, stop2, get_raw_bgr2 = make_local_grab(CAM1_SERIAL, rs_width, rs_height, rs_fps)
 
-    # 3b. Recording dir
+    # 3b. Recording dir. run_stamp is always defined (used as <name> prefix
+    # for videogen even when --no-record).
+    run_stamp = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    base_name = run_stamp
+    if videogen:
+        base_name += '_VLM'
+    prefix_str = f'{output_prefix}_' if output_prefix else ''
+    run_dir_name = f'{prefix_str}{base_name}'
     record_dir = None
     obs_dir1 = None
     obs_dir2 = None
     frame_idx = 0
     if record:
         ckpt = pathlib.Path(ckpt_path).resolve()
-        run_stamp = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-        record_dir = ckpt.parent / ckpt.stem / run_stamp
+        record_dir = ckpt.parent / ckpt.stem / run_dir_name
         obs_dir1 = record_dir / 'observations' / 'image1'
         obs_dir2 = record_dir / 'observations' / 'image2'
         obs_dir1.mkdir(parents=True, exist_ok=True)
@@ -427,17 +735,21 @@ def main(ckpt_path, server_host, server_port,
                 print(f'stop_cameras: {label} stop failed: {e!r}')
 
     # 4. Policy warm-up — burn JIT/CUDA-init cost on a dummy obs.
-    # Use the same batch size as the real loop so the warm-up covers the
-    # CUDA allocator state we will hit during inference.
-    print(f'Warming up policy inference (batch={num_samples})')
+    # Use the same batch size as the real loop (oversample, which is then
+    # pruned to num_samples post-inference).
+    print(f'Warming up policy inference (batch={oversample})')
     f1_warm = grab1()
     f2_warm = grab2()
     q_warm = client.get_joint_pos().result().astype(np.float32)
+    # Separate seed for warm-up so the per-cycle RNG state isn't consumed.
+    torch.manual_seed(seed - 1)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed - 1)
 
     def _tile_img(f):
         x = np.broadcast_to(
             np.stack([f] * n_obs, axis=0)[None, ...],
-            (num_samples, n_obs, *f.shape),
+            (oversample, n_obs, *f.shape),
         ).copy()
         return torch.from_numpy(x).to(device_t)
 
@@ -451,13 +763,13 @@ def main(ckpt_path, server_host, server_port,
         if use_state:
             st_warm = np.broadcast_to(
                 np.stack([q_warm] * n_obs, axis=0)[None, ...],
-                (num_samples, n_obs, q_warm.shape[0]),
+                (oversample, n_obs, q_warm.shape[0]),
             ).copy()
             warm_obs['state'] = torch.from_numpy(st_warm).to(device_t)
         _ = policy.predict_action(warm_obs)
 
     print(f'Starting blocking policy loop. n_obs={n_obs}, n_act={n_act}, '
-          f'num_samples={num_samples}, dt={dt:.4f}s, '
+          f'oversample={oversample}, num_samples={num_samples}, dt={dt:.4f}s, '
           f'chunk duration={n_act * dt:.2f}s. '
           f'Ctrl+C to stop and hold pose.{" (DRY RUN — no commands sent)" if dry_run else ""}')
 
@@ -486,16 +798,18 @@ def main(ckpt_path, server_host, server_port,
             # ---- 5. Capture one fresh observation (both images + state) ----
             # If the policy expects n_obs > 1, tile the same most-recent obs to
             # match the expected shape (we do not maintain any history here).
-            # We then tile the obs along the batch dim by num_samples so a
-            # single forward pass produces num_samples independent action
+            # We then tile the obs along the batch dim by `oversample` so a
+            # single forward pass produces `oversample` independent action
             # chunks (each draws its own noise init in conditional_sample).
+            # The set is pruned to `num_samples` post-inference via greedy
+            # FPS on terminal-weighted joint-space L2.
             f1 = grab1()
             f2 = grab2()
             save_obs(f1, f2)
 
             def _tile_np(f):
                 x = np.stack([f] * n_obs, axis=0)[None, ...]
-                return np.broadcast_to(x, (num_samples, *x.shape[1:])).copy()
+                return np.broadcast_to(x, (oversample, *x.shape[1:])).copy()
 
             obs_img1_np = _tile_np(f1)
             obs_img2_np = _tile_np(f2)
@@ -504,10 +818,16 @@ def main(ckpt_path, server_host, server_port,
                 obs_state_one = np.stack([q] * n_obs, axis=0)[None, ...]  # (1, n_obs, 7)
                 obs_state_np = np.broadcast_to(
                     obs_state_one,
-                    (num_samples, *obs_state_one.shape[1:]),
-                ).copy()                                                  # (N, n_obs, 7)
+                    (oversample, *obs_state_one.shape[1:]),
+                ).copy()                                                  # (M, n_obs, 7)
 
-            # ---- 6. Inference (batched: one forward pass -> N samples) ----
+            # ---- 6. Inference (batched: one forward pass -> M samples) ----
+            # Re-seed per cycle so the M noise inits at cycle k are
+            # reproducible across runs (identical obs -> identical samples).
+            cycle_seed = seed + cycle
+            torch.manual_seed(cycle_seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(cycle_seed)
             t_inf_start = time.time()
             with torch.no_grad():
                 obs_t = {
@@ -517,34 +837,77 @@ def main(ckpt_path, server_host, server_port,
                 if use_state:
                     obs_t['state'] = torch.from_numpy(obs_state_np).to(device_t)
                 pred = policy.predict_action(obs_t)
-            actions_all = pred['action'].cpu().numpy()  # (N, n_act, 7)
-            actions = actions_all[0, :n_act_exec]       # send first n_act_exec waypoints of sample 0
+            actions_all = pred['action'].cpu().numpy()       # (M, n_act, 7)
+            actions_full_all = pred['action_pred'].cpu().numpy()  # (M, horizon, 7)
             inference_latency = time.time() - t_inf_start
 
-            # Persist the full (N, n_act, 7) tensor for offline analysis.
+            # ---- 6a. Prune to num_samples via greedy FPS on EXECUTED window.
+            keep = list(range(actions_all.shape[0]))
+            if oversample > num_samples:
+                actions_exec = actions_all[:, :n_act_exec]
+                keep = select_diverse_indices(
+                    actions_exec, k=num_samples,
+                    terminal_weight=4.0, n_terminal=2,
+                    joint_weights=JOINT_WEIGHTS_FOR_DIVERSITY,
+                    seed_idx=0,
+                )
+                if record_dir is not None:
+                    np.save(record_dir / f'actions_full_pre_{cycle:06d}.npy',
+                            actions_full_all)
+                    np.save(record_dir / f'keep_indices_{cycle:06d}.npy',
+                            np.asarray(keep, dtype=np.int32))
+                actions_all = actions_all[keep]
+                actions_full_all = actions_full_all[keep]
+                print(f'cycle {cycle}: oversampled {oversample}, '
+                      f'kept indices {keep}')
+
+            # Persist the kept (post-prune) tensors for offline analysis.
             if record_dir is not None:
                 np.save(record_dir / f'actions_{cycle:06d}.npy', actions_all)
+                np.save(record_dir / f'actions_full_{cycle:06d}.npy', actions_full_all)
 
-            # Per-DOF stats across the N samples. mean/min/max collapse over
-            # both samples and time (chunk envelope per joint). std is
-            # reported per-timestep so we can see how sample disagreement
-            # evolves through the chunk (typically small near t=0 where the
-            # chunk is conditioned on the obs, larger near t=n_act-1).
-            sample_std = actions_all.std(axis=0)                    # (n_act, 7)
-            stat_mean = actions_all.mean(axis=(0, 1))               # (7,)
-            stat_min = actions_all.min(axis=(0, 1))                 # (7,)
-            stat_max = actions_all.max(axis=(0, 1))                 # (7,)
-            fmt = lambda v: '[' + ' '.join(f'{x:+.4f}' for x in v) + ']'
-            print(f'cycle {cycle}: stats over {num_samples} samples (per-DOF):')
-            print(f'  mean = {fmt(stat_mean)}')
-            print(f'  min  = {fmt(stat_min)}')
-            print(f'  max  = {fmt(stat_max)}')
-            print(f'  std across {num_samples} samples, shape '
-                  f'(n_act={sample_std.shape[0]}, 7):')
-            for t in range(sample_std.shape[0]):
-                print(f'    t={t:2d}: {fmt(sample_std[t])}')
+            # ---- 6b. Submit image2 + N trajectories to cv16, block on ranking.
+            # Robot stays paused at the previous chunk's last waypoint until
+            # the cv16 mp4s AND ranking.json for THIS cycle exist.
+            winner_idx = 0
+            if videogen:
+                raw_bgr = get_raw_bgr2()
+                if videogen_hz == '15':
+                    full_NT7 = np.concatenate(
+                        [actions_full_all, actions_full_all[:, -1:, :]],
+                        axis=1)                                  # (N, 33, 7)
+                else:  # '30'
+                    N_s, T_orig, D = actions_full_all.shape
+                    full_30hz = np.empty((N_s, 2 * T_orig, D),
+                                         dtype=actions_full_all.dtype)
+                    full_30hz[:, 0::2, :] = actions_full_all
+                    full_30hz[:, 1:-1:2, :] = 0.5 * (
+                        actions_full_all[:, :-1, :] + actions_full_all[:, 1:, :])
+                    full_30hz[:, -1, :] = actions_full_all[:, -1, :]
+                    full_NT7 = full_30hz[:, :33, :]              # (N, 33, 7)
+                name = f'{run_stamp}_{cycle:06d}'
+                scratch = (record_dir / 'videogen') if record_dir is not None \
+                          else pathlib.Path('/tmp')
+                scratch.mkdir(parents=True, exist_ok=True)
+                submit_videogen(name, raw_bgr, full_NT7, scratch)
+                wait_for_videogen(name, num_samples,
+                                  videogen_poll_sec, videogen_timeout_sec)
+                wait_for_ranking(name, videogen_poll_sec, videogen_timeout_sec)
+                fetch_videogen(name, scratch)
+                ranking_path = scratch / name / 'ranking.json'
+                with open(ranking_path) as rf:
+                    ranking = json.load(rf)
+                winner_idx = int(ranking['winner_idx'])
+                if not (0 <= winner_idx < num_samples):
+                    raise RuntimeError(
+                        f'ranking.json winner_idx={winner_idx} out of range '
+                        f'[0, {num_samples}) at {ranking_path}')
+                print(f'cycle {cycle}: VLM winner_idx={winner_idx} '
+                      f'(votes={ranking.get("votes")}, '
+                      f'tied={ranking.get("tied_indices")})')
 
             # ---- 7. Schedule the entire chunk back-to-back, starting now ----
+            actions = actions_all[winner_idx, :n_act_exec]
             schedule_anchor = time.time()
             action_ts = (np.arange(1, len(actions) + 1, dtype=np.float64) * dt
                          + schedule_anchor)
@@ -580,27 +943,31 @@ def main(ckpt_path, server_host, server_port,
         except Exception as e:
             print(f'Failed to hold pose: {e}')
         stop_reason = 'keyboard_interrupt'
+    except Exception as e:
+        import traceback
+        print(f'\nLoop crashed: {e!r}. Holding current pose before re-raising.')
+        traceback.print_exc()
+        try:
+            client.clear_waypoints()
+            cur = client.get_joint_pos().result()
+            client.command_joint_pos(cur)
+        except Exception as e2:
+            print(f'Failed to hold pose: {e2}')
+        stop_reason = f'exception:{type(e).__name__}'
+        raise
     finally:
         stop_cameras()
         print(f'Run finished after {total_steps} action waypoints over '
               f'{cycle} cycles (stop_reason={stop_reason}).')
         final_dir = record_dir
         if record_dir is not None:
-            label = None
-            while label is None:
-                try:
-                    ans = input('Label this rollout — [s]uccess or [f]ailure? ').strip().lower()
-                except EOFError:
-                    print('No input available; leaving run dir unlabeled.')
-                    break
-                if ans in ('s', 'success'):
-                    label = 'success'
-                elif ans in ('f', 'failure', 'fail'):
-                    label = 'failure'
-                else:
-                    print("  Please type 's' (success) or 'f' (failure).")
-            if label is not None:
-                new_dir = record_dir.parent / f'{label}_{record_dir.name}'
+            try:
+                label = input('Label this rollout (free text, blank to skip): ').strip()
+            except EOFError:
+                print('No input available; leaving run dir unlabeled.')
+                label = ''
+            if label:
+                new_dir = record_dir.parent / f'{prefix_str}{label}_{base_name}'
                 try:
                     record_dir.rename(new_dir)
                     final_dir = new_dir

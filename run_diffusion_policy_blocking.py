@@ -958,7 +958,6 @@ def main(ckpt_path, server_host, server_port,
                       f'(votes={ranking.get("votes")}, '
                       f'tied={ranking.get("tied_indices")})')
 
-            # ---- 7. Schedule the entire chunk back-to-back, starting now ----
             # Under --videogen, winner_idx is the VLM-chosen sample. Otherwise
             # it stays at 0 (sample 0 drives the robot).
             actions = actions_all[winner_idx, :n_act_exec]

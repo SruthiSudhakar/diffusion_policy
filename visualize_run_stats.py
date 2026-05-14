@@ -30,8 +30,16 @@ def main(run_dir, out_path):
     if not action_files:
         sys.exit(f'no actions_*.npy under {run_dir}')
 
+    # Frames are written by run_diffusion_policy_blocking_upright_bottle.py
+    # into observations/image1/ and observations/image2/ (per-camera subdirs).
+    # Older runs wrote them directly into observations/ or the run dir.
     obs_dir = run_dir / 'observations'
-    frame_dir = obs_dir if obs_dir.is_dir() else run_dir
+    for candidate in (obs_dir / 'image1', obs_dir / 'image2', obs_dir, run_dir):
+        if candidate.is_dir() and any(candidate.glob('frame_*.jpg')):
+            frame_dir = candidate
+            break
+    else:
+        frame_dir = obs_dir if obs_dir.is_dir() else run_dir
 
     cycles = []
     for af in action_files:
