@@ -28,8 +28,8 @@ task.dataset.zarr_path=data/pnp_red_lego_to_brown_bowl/replay_200ex.zarr \
 One-time data conversion:
 python scripts_upright_bottle/convert_upright_bottle_to_zarr.py \
 --src /proj/vondrick3/datasets/expert_data_jgd_UprightBottle \
---dst data/upright_bottle/replay.zarr \
---image-size 640 360 --subsample 3 --success-only
+--dst data/upright_bottle/replay_subsample1.zarr \
+--image-size 640 360 --subsample 1 --success-only
 
 Training (Image1 + Image2 + State):
 cd /proj/vondrick3/sruthi/Appaji/diffusion_policy
@@ -56,3 +56,72 @@ training.seed=42 \
 task.dataset_path=data/upright_bottle/replay.zarr \
 task.dataset.zarr_path=data/upright_bottle/replay.zarr \
 'hydra.run.dir=data/jgd/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}'
+
+
+
+
+Cup Plate Task:
+python scripts_upright_bottle/convert_upright_bottle_to_zarr.py \
+--src /proj/vondrick3/datasets/expert_data_jgd_cup_plate \
+--dst data/cup_plate/replay.zarr \
+--image-size 640 360 --subsample 3 \
+--prefixes bag glass remote
+
+cv12
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 OMP_NUM_THREADS=4 TOKENIZERS_PARALLELISM=false \
+accelerate launch --config_file accelerate_config.yaml --num_processes 8 \
+train.py --config-dir=. \
+--config-name=cup_plate_image_only_diffusion_policy_cnn.yaml \
+training.seed=42 \
+task.dataset_path=data/cup_plate/replay.zarr \
+task.dataset.zarr_path=data/cup_plate/replay.zarr \
+'hydra.run.dir=data/jgd/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}'
+
+Bag Plate Task:
+python scripts_upright_bottle/convert_upright_bottle_to_zarr.py \
+--src /proj/vondrick3/datasets/expert_data_jgd_bag_plate \
+--dst data/bag_plate/replay.zarr \
+--image-size 640 360 --subsample 3 \
+--prefixes box glass remote
+
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 OMP_NUM_THREADS=4 TOKENIZERS_PARALLELISM=false \
+accelerate launch --config_file accelerate_config.yaml --num_processes 8 \
+train.py --config-dir=. \
+--config-name=bag_plate_image_only_diffusion_policy_cnn.yaml \
+training.seed=42 \
+task.dataset_path=data/bag_plate/replay.zarr \
+task.dataset.zarr_path=data/bag_plate/replay.zarr \
+'hydra.run.dir=data/jgd/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}'
+
+Push Bowl Task:
+python scripts_upright_bottle/convert_upright_bottle_to_zarr.py \
+--src /proj/vondrick3/datasets/expert_data_jgd_push_bowl \
+--dst data/push_bowl/replay.zarr \
+--image-size 640 360 --subsample 3 --success-only
+
+python scripts_upright_bottle/convert_upright_bottle_to_zarr.py \
+--src /proj/vondrick3/datasets/expert_data_jgd_push_bowl \
+--dst data/push_bowl/replay_subsample2.zarr \
+--image-size 640 360 --subsample 2 --success-only
+
+cv11
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 OMP_NUM_THREADS=4 TOKENIZERS_PARALLELISM=false \
+accelerate launch --config_file accelerate_config.yaml --num_processes 8 \
+train.py --config-dir=. \
+--config-name=push_bowl_image_only_diffusion_policy_cnn.yaml \
+training.seed=42 \
+task.dataset_path=data/push_bowl/replay.zarr \
+task.dataset.zarr_path=data/push_bowl/replay.zarr \
+task.dataset.val_ratio=0.1 \
+'hydra.run.dir=data/jgd/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}'
+
+cv12
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 OMP_NUM_THREADS=4 TOKENIZERS_PARALLELISM=false \
+accelerate launch --config_file accelerate_config.yaml --num_processes 8 \
+train.py --config-dir=. \
+--config-name=push_bowl_image_only_diffusion_policy_cnn.yaml \
+training.seed=42 \
+task.dataset_path=data/push_bowl/replay_subsample2.zarr \
+task.dataset.zarr_path=data/push_bowl/replay_subsample2.zarr \
+task.dataset.val_ratio=0.1 \
+'hydra.run.dir=data/jgd/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}_15hz'

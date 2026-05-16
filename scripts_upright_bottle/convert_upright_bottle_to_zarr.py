@@ -59,6 +59,9 @@ def main():
     parser.add_argument('--success-only', action='store_true', default=True)
     parser.add_argument('--include-failures', dest='success_only',
         action='store_false')
+    parser.add_argument('--prefixes', type=str, nargs='+', default=None,
+        help='if given, include all <prefix>_<num>_*.npy episodes for each '
+             'prefix (overrides --success-only). e.g. bag glass remote')
     parser.add_argument('--max-episodes', type=int, default=None,
         help='for smoke-testing: only convert this many episodes')
     parser.add_argument('--episode-min', type=int, default=None,
@@ -76,17 +79,33 @@ def main():
             f'remove it first if you want to rebuild')
     dst.parent.mkdir(parents=True, exist_ok=True)
 
-    prefix = 'success_' if args.success_only else ''
-    ep_re = re.compile(rf'^{prefix}(\d+)_') if prefix else re.compile(r'^(\d+)_')
+    if args.prefixes:
+        prefix_group = '|'.join(re.escape(p) for p in args.prefixes)
+        ep_re = re.compile(rf'^(?:{prefix_group})_(\d+)_')
 
-    def ep_num(p):
-        m = ep_re.match(p.name)
-        return int(m.group(1)) if m else None
+        def ep_num(p):
+            m = ep_re.match(p.name)
+            return int(m.group(1)) if m else None
 
-    all_npy = sorted(
-        (p for p in src.glob(f'{prefix}*.npy') if ep_num(p) is not None),
-        key=ep_num,
-    )
+        candidates = []
+        for pref in args.prefixes:
+            candidates.extend(src.glob(f'{pref}_*.npy'))
+        all_npy = sorted(
+            (p for p in candidates if ep_num(p) is not None),
+            key=lambda p: (p.name.split('_', 1)[0], ep_num(p)),
+        )
+    else:
+        prefix = 'success_' if args.success_only else ''
+        ep_re = re.compile(rf'^{prefix}(\d+)_') if prefix else re.compile(r'^(\d+)_')
+
+        def ep_num(p):
+            m = ep_re.match(p.name)
+            return int(m.group(1)) if m else None
+
+        all_npy = sorted(
+            (p for p in src.glob(f'{prefix}*.npy') if ep_num(p) is not None),
+            key=ep_num,
+        )
     if args.episode_min is not None or args.episode_max is not None:
         lo = args.episode_min if args.episode_min is not None else -10**9
         hi = args.episode_max if args.episode_max is not None else 10**9
@@ -104,8 +123,12 @@ def main():
         print(f'skipping {len(skipped)} episodes with missing frames dirs: {skipped}')
     if args.max_episodes is not None:
         npy_files = npy_files[:args.max_episodes]
-    print(f'found {len(npy_files)} episodes (success_only={args.success_only}, '
-          f'episode range=[{args.episode_min}, {args.episode_max}])')
+    if args.prefixes:
+        print(f'found {len(npy_files)} episodes (prefixes={args.prefixes}, '
+              f'episode range=[{args.episode_min}, {args.episode_max}])')
+    else:
+        print(f'found {len(npy_files)} episodes (success_only={args.success_only}, '
+              f'episode range=[{args.episode_min}, {args.episode_max}])')
 
     import zarr
     store = zarr.DirectoryStore(str(dst))
