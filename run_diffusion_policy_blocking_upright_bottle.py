@@ -43,13 +43,24 @@ cup plate:
 python run_diffusion_policy_blocking_upright_bottle.py \
 -i /home/cvlabusers/Appaji/diffusion_policy/data/jgd/2026.05.14/10.44.35_train_diffusion_unet_hybrid_cup_plate_image_only/checkpoints/epoch=0250-train_loss=0.0238.ckpt \
 --output-prefix 1jgd \
---videogen
+--videogen 
 
 bag plate:
+python run_diffusion_policy_blocking_upright_bottle.py \
+-i /home/cvlabusers/Appaji/diffusion_policy/data/jgd/2026.05.14/15.07.10_train_diffusion_unet_hybrid_bag_plate_image_only/checkpoints/epoch=0300-train_loss=0.0208.ckpt \
+--pickup /home/cvlabusers/Appaji/i2rt/pickup_bag.npy \
+--output-prefix 7 \
+--videogen
+
+push bowl:
 
 python run_diffusion_policy_blocking_upright_bottle.py \
--i /home/cvlabusers/Appaji/diffusion_policy/data/jgd/2026.05.14/15.07.10_train_diffusion_unet_hybrid_bag_plate_image_only/checkpoints/epoch=0250-train_loss=0.0288.ckpt \
---pickup /home/cvlabusers/Appaji/i2rt/pickup_bag.npy \
+-i /home/cvlabusers/Appaji/diffusion_policy/data/jgd/2026.05.15/18.07.44_train_diffusion_unet_hybrid_push_bowl_image_only/checkpoints/epoch=0250-train_loss=0.0265.ckpt \
+--videogen \
+--output-prefix 2
+
+python run_diffusion_policy_blocking_upright_bottle.py \
+-i /home/cvlabusers/Appaji/diffusion_policy/data/jgd/2026.05.15/18.12.31_train_diffusion_unet_hybrid_push_bowl_image_only_15hz/checkpoints/epoch=0250-train_loss=0.0188.ckpt \
 --output-prefix 1jgd \
 --videogen
 """
@@ -427,7 +438,7 @@ def make_recording_wrapper(grab_fn, stop_fn, video_path, fps):
               help='Number of actions to actually execute from each predicted '
                    'chunk of length n_action_steps (e.g. 16). 0 (default) means '
                    'execute the full chunk. Must be in [1, n_action_steps].')
-@click.option('--num-samples', default=10, type=int,
+@click.option('--num-samples', default=5, type=int,
               help='Number of action chunks to sample per observation. The same '
                    'obs is tiled along the batch dim and run through the policy '
                    'in a single forward pass; each sample uses an independent '
@@ -477,7 +488,7 @@ def make_recording_wrapper(grab_fn, stop_fn, video_path, fps):
                    'the robot\'s actual position and the last scheduled action. '
                    'Use to tune --settle-sec / --max-joint-speed. Skipped under '
                    '--dry-run since no commands are sent.')
-@click.option('--max-steps', default=96, type=int,
+@click.option('--max-steps', default=144, type=int,
               help='Max total action waypoints scheduled to the robot before '
                    'the loop auto-stops (each cycle schedules n_act_exec). '
                    'Stop is also triggered by Ctrl+C. After either, the '
@@ -496,7 +507,7 @@ def make_recording_wrapper(grab_fn, stop_fn, video_path, fps):
               help='How often to poll cv16 for the generated mp4s / ranking.json.')
 @click.option('--videogen-timeout-sec', default=1800.0, type=float,
               help='Hard ceiling per cycle. Exceeding raises (after holding pose).')
-@click.option('--videogen-hz', type=click.Choice(['15', '30']), default='30',
+@click.option('--videogen-hz', type=click.Choice(['15', '30', '60']), default='30',
               help='Trajectory rate sent to the cv16 video model. 15 sends the '
                    "policy's native 15Hz waypoints (32 padded to 33). 30 (default) "
                    'linearly upsamples to 30Hz and sends the first 33 samples '
@@ -510,6 +521,8 @@ def make_recording_wrapper(grab_fn, stop_fn, video_path, fps):
                    'Stays in front even after the label is added '
                    '(e.g. "exp1" -> "exp1_<run_stamp>" -> '
                    '"exp1_<label>_<run_stamp>"). Default empty (no prefix).')
+@click.option('--picking-strategy', default='best', type=str,
+              help='Picking strategy. "best" for best trajectory, "worst" for worst trajectory, "random" for random trajectory')
 def main(ckpt_path, server_host, server_port,
          frequency, rs_width, rs_height, rs_fps,
          device, num_inference_steps, n_act_exec, scheduler, num_samples, oversample,
@@ -517,7 +530,7 @@ def main(ckpt_path, server_host, server_port,
          dry_run, record, record_jpeg_quality, video_fps, log_settle_err,
          max_steps,
          videogen, videogen_poll_sec, videogen_timeout_sec, videogen_hz, seed,
-         output_prefix):
+         output_prefix, picking_strategy):
     if num_samples < 1:
         raise click.BadParameter('--num-samples must be >= 1')
     if oversample == 0:
@@ -876,7 +889,7 @@ def main(ckpt_path, server_host, server_port,
                     full_NT7 = np.concatenate(
                         [actions_full_all, actions_full_all[:, -1:, :]],
                         axis=1)                                  # (N, 33, 7)
-                else:  # '30'
+                elif videogen_hz == '30':  # '30'
                     N_s, T_orig, D = actions_full_all.shape
                     full_30hz = np.empty((N_s, 2 * T_orig, D),
                                          dtype=actions_full_all.dtype)
@@ -885,6 +898,21 @@ def main(ckpt_path, server_host, server_port,
                         actions_full_all[:, :-1, :] + actions_full_all[:, 1:, :])
                     full_30hz[:, -1, :] = actions_full_all[:, -1, :]
                     full_NT7 = full_30hz[:, :33, :]              # (N, 33, 7)
+                elif videogen_hz == '60':  # '60'
+                    N_s, T_orig, D = actions_full_all.shape
+                    full_60hz = np.empty((N_s, 4 * T_orig, D),
+                                         dtype=actions_full_all.dtype)
+                    full_60hz[:, 0::4, :] = actions_full_all
+                    full_60hz[:, 1:-3:4, :] = (
+                        0.75 * actions_full_all[:, :-1, :]
+                        + 0.25 * actions_full_all[:, 1:, :])
+                    full_60hz[:, 2:-2:4, :] = 0.5 * (
+                        actions_full_all[:, :-1, :] + actions_full_all[:, 1:, :])
+                    full_60hz[:, 3:-1:4, :] = (
+                        0.25 * actions_full_all[:, :-1, :]
+                        + 0.75 * actions_full_all[:, 1:, :])
+                    full_60hz[:, -3:, :] = actions_full_all[:, -1:, :]
+                    full_NT7 = full_60hz[:, :33, :]              # (N, 33, 7)
                 name = f'{run_stamp}_{cycle:06d}'
                 scratch = (record_dir / 'videogen') if record_dir is not None \
                           else pathlib.Path('/tmp')
@@ -897,7 +925,17 @@ def main(ckpt_path, server_host, server_port,
                 ranking_path = scratch / name / 'ranking.json'
                 with open(ranking_path) as rf:
                     ranking = json.load(rf)
-                winner_idx = int(ranking['winner_idx'])
+                
+                if picking_strategy == 'best':
+                    winner_idx = int(ranking['winner_idx'])
+                elif picking_strategy == 'worst':
+                    print("VLM Picking Worst")
+                    winner_idx = int(np.argmin(ranking['votes']))
+                elif picking_strategy == 'random':
+                    print("VLM Picking Random")
+                    winner_idx = int(np.random.choice(num_samples))
+                else:
+                    raise RuntimeError(f'Invalid picking strategy: {picking_strategy}')
                 if not (0 <= winner_idx < num_samples):
                     raise RuntimeError(
                         f'ranking.json winner_idx={winner_idx} out of range '
