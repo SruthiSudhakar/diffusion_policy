@@ -57,12 +57,12 @@ push bowl:
 python run_diffusion_policy_blocking_upright_bottle.py \
 -i /home/cvlabusers/Appaji/diffusion_policy/data/jgd/2026.05.15/18.07.44_train_diffusion_unet_hybrid_push_bowl_image_only/checkpoints/epoch=0250-train_loss=0.0265.ckpt \
 --videogen \
---output-prefix 2
+--output-prefix 4
 
 python run_diffusion_policy_blocking_upright_bottle.py \
 -i /home/cvlabusers/Appaji/diffusion_policy/data/jgd/2026.05.15/18.12.31_train_diffusion_unet_hybrid_push_bowl_image_only_15hz/checkpoints/epoch=0250-train_loss=0.0188.ckpt \
---output-prefix 1jgd \
---videogen
+--videogen \
+--output-prefix 4
 """
 import sys
 sys.stdout = open(sys.stdout.fileno(), mode='w', buffering=1)
@@ -488,7 +488,7 @@ def make_recording_wrapper(grab_fn, stop_fn, video_path, fps):
                    'the robot\'s actual position and the last scheduled action. '
                    'Use to tune --settle-sec / --max-joint-speed. Skipped under '
                    '--dry-run since no commands are sent.')
-@click.option('--max-steps', default=144, type=int,
+@click.option('--max-steps', default=96, type=int,
               help='Max total action waypoints scheduled to the robot before '
                    'the loop auto-stops (each cycle schedules n_act_exec). '
                    'Stop is also triggered by Ctrl+C. After either, the '
@@ -871,8 +871,8 @@ def main(ckpt_path, server_host, server_port,
                             np.asarray(keep, dtype=np.int32))
                 actions_all = actions_all[keep]
                 actions_full_all = actions_full_all[keep]
-                print(f'cycle {cycle}: oversampled {oversample}, '
-                      f'kept indices {keep}')
+                # print(f'cycle {cycle}: oversampled {oversample}, '
+                #       f'kept indices {keep}')
 
             # Persist the kept (post-prune) tensors for offline analysis.
             if record_dir is not None:
@@ -927,6 +927,7 @@ def main(ckpt_path, server_host, server_port,
                     ranking = json.load(rf)
                 
                 if picking_strategy == 'best':
+                    print("VLM Picking Best")
                     winner_idx = int(ranking['winner_idx'])
                 elif picking_strategy == 'worst':
                     print("VLM Picking Worst")

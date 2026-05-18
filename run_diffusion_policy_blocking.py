@@ -25,7 +25,13 @@ cd /home/cvlabusers/Appaji/diffusion_policy
 conda activate jgdrobodiff
 python run_diffusion_policy_blocking.py \
 -i /home/cvlabusers/Appaji/diffusion_policy/data/jgd/2026.05.06/23.17.10_train_diffusion_unet_hybrid_pnp_lego_image/checkpoints/epoch=0200-train_loss=0.0116.ckpt \
---output-prefix 0 --picked-up
+--output-prefix 0
+
+python run_diffusion_policy_blocking.py \
+-i /home/cvlabusers/Appaji/diffusion_policy/data/jgd/2026.05.06/23.17.10_train_diffusion_unet_hybrid_pnp_lego_image/checkpoints/epoch=0150-train_loss=0.0160.ckpt \
+--videogen \
+--output-prefix 0_poorcritic
+
 """
 import sys
 sys.stdout = open(sys.stdout.fileno(), mode='w', buffering=1)
@@ -59,8 +65,11 @@ VIDEOGEN_T = 33  # server's --video_length
 
 PICKUP_TRAJ_PATH = '/home/cvlabusers/Appaji/i2rt/pickup.npy'
 
+# RealSense serial of the single camera this single-cam policy was trained on.
+CAM_SERIAL = "317222070925"
 
-def make_local_grab(rs_width, rs_height, rs_fps):
+
+def make_local_grab(rs_width, rs_height, rs_fps, serial=CAM_SERIAL):
     """Open RealSense locally and return (grab, stop, get_raw_bgr).
 
     grab() -> (3,360,640) float32 RGB in [0,1] (what the policy sees).
@@ -69,9 +78,10 @@ def make_local_grab(rs_width, rs_height, rs_fps):
     has been captured yet.
     """
     import pyrealsense2 as rs  # imported here so cv12 doesn't need it
-    print(f'Opening RealSense color stream: {rs_width}x{rs_height} @ {rs_fps} BGR8')
+    print(f'Opening RealSense color stream (serial={serial}): {rs_width}x{rs_height} @ {rs_fps} BGR8')
     pipe = rs.pipeline()
     rs_cfg = rs.config()
+    rs_cfg.enable_device(serial)
     rs_cfg.enable_stream(rs.stream.color, rs_width, rs_height, rs.format.bgr8, rs_fps)
     pipe.start(rs_cfg)
 
@@ -498,7 +508,7 @@ def select_diverse_indices(actions_exec, k, terminal_weight=4.0, n_terminal=2,
               help='Number of actions to actually execute from each predicted '
                    'chunk of length n_action_steps (e.g. 16). 0 (default) means '
                    'execute the full chunk. Must be in [1, n_action_steps].')
-@click.option('--num-samples', default=4, type=int,
+@click.option('--num-samples', default=5, type=int,
               help='Number of action chunks to sample per observation. The same '
                    'obs is tiled along the batch dim and run through the policy '
                    'in a single forward pass; each sample uses an independent '
