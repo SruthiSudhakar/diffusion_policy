@@ -39,6 +39,7 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
             cond_predict_scale=True,
             obs_encoder_group_norm=False,
             eval_fixed_crop=False,
+            text_embed_dropout_prob=0.0,
             # parameters passed to step
             **kwargs):
         super().__init__()
@@ -165,6 +166,10 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
         self.n_action_steps = n_action_steps
         self.n_obs_steps = n_obs_steps
         self.obs_as_global_cond = obs_as_global_cond
+        self.text_embed_dropout_prob = float(text_embed_dropout_prob)
+        if not (0.0 <= self.text_embed_dropout_prob <= 1.0):
+            raise ValueError(
+                f'text_embed_dropout_prob must be in [0,1], got {text_embed_dropout_prob}')
         self.kwargs = kwargs
 
         if num_inference_steps is None:
@@ -291,6 +296,21 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
         nactions = self.normalizer['action'].normalize(batch['action'])
         batch_size = nactions.shape[0]
         horizon = nactions.shape[1]
+
+        # Classifier-free-guidance-style dropout on text_embed: with
+        # per-sample probability p, replace the entire (T, D) text embed
+        # with the null embed (zeros, matching the identity normalizer
+        # used for text_embed). Forces the image branch to carry signal
+        # so the model can't shortcut entirely on text. No-op when
+        # text_embed_dropout_prob == 0 or text_embed isn't an obs.
+        if (self.text_embed_dropout_prob > 0.0
+                and 'text_embed' in nobs
+                and self.training):
+            te = nobs['text_embed']                                  # (B, T, D)
+            keep = (torch.rand(te.shape[0], device=te.device)
+                    >= self.text_embed_dropout_prob)                  # (B,)
+            keep = keep.to(te.dtype).view(-1, *([1] * (te.dim() - 1)))
+            nobs['text_embed'] = te * keep
 
         # handle different ways of passing observation
         local_cond = None

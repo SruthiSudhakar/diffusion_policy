@@ -86,6 +86,12 @@ policy:
   num_inference_steps: 100
   obs_as_global_cond: true
   obs_encoder_group_norm: true
+  # CFG-style per-sample dropout on text_embed during training.
+  # Forces the image branch to learn useful features (without this the model
+  # collapses onto text and ignores images). 0.0 keeps old behavior.
+  # Recommended starting point: 0.3 — high enough that the model can't
+  # shortcut on text, low enough that it still learns to use the prompt.
+  text_embed_dropout_prob: 0.3
   shape_meta:
     action:
       shape:

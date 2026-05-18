@@ -72,7 +72,8 @@ python run_diffusion_policy_blocking_upright_bottle.py \
 --max-steps 64 \
 --pickup /home/cvlabusers/Appaji/i2rt/pickup_bag_2.npy \
 --output-prefix 0b \
---prompt "pick up the glass"
+--prompt "pick up the glass" \
+--winner-idx 0
 
 """
 import sys

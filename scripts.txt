@@ -93,6 +93,15 @@ task.dataset_path=data/bag_plate/replay.zarr \
 task.dataset.zarr_path=data/bag_plate/replay.zarr \
 'hydra.run.dir=data/jgd/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}'
 
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 OMP_NUM_THREADS=4 TOKENIZERS_PARALLELISM=false \
+accelerate launch --config_file accelerate_config.yaml --num_processes 8 \
+train.py --config-dir=. \
+--config-name=bag_plate_text_diffusion_policy_cnn.yaml \
+training.seed=42 \
+task.dataset_path=data/bag_plate/replay.zarr \
+task.dataset.zarr_path=data/bag_plate/replay.zarr \
+'hydra.run.dir=data/jgd/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}'
+
 Push Bowl Task:
 python scripts_upright_bottle/convert_upright_bottle_to_zarr.py \
 --src /proj/vondrick3/datasets/expert_data_jgd_push_bowl \
