@@ -57,7 +57,7 @@ push bowl:
 python run_diffusion_policy_blocking_upright_bottle.py \
 -i /home/cvlabusers/Appaji/diffusion_policy/data/jgd/2026.05.15/18.07.44_train_diffusion_unet_hybrid_push_bowl_image_only/checkpoints/epoch=0250-train_loss=0.0265.ckpt \
 --videogen \
---output-prefix 4
+--output-prefix 1jgdsgd
 
 python run_diffusion_policy_blocking_upright_bottle.py \
 -i /home/cvlabusers/Appaji/diffusion_policy/data/jgd/2026.05.15/18.12.31_train_diffusion_unet_hybrid_push_bowl_image_only_15hz/checkpoints/epoch=0250-train_loss=0.0188.ckpt \
@@ -445,7 +445,7 @@ def make_recording_wrapper(grab_fn, stop_fn, video_path, fps):
                    'noise init so the chunks differ. Sample 0 drives the robot '
                    'unless --videogen overrides it with the VLM-chosen index; '
                    'all samples are saved when --record is set.')
-@click.option('--oversample', default=100, type=int,
+@click.option('--oversample', default=50, type=int,
               help='Sample this many candidates per cycle, then prune to '
                    '--num-samples via greedy farthest-point sampling on '
                    'terminal-weighted joint-space L2 over the executed window. '

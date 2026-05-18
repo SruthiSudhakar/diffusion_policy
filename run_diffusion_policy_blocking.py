@@ -28,9 +28,9 @@ python run_diffusion_policy_blocking.py \
 --output-prefix 0
 
 python run_diffusion_policy_blocking.py \
--i /home/cvlabusers/Appaji/diffusion_policy/data/jgd/2026.05.06/23.17.10_train_diffusion_unet_hybrid_pnp_lego_image/checkpoints/epoch=0150-train_loss=0.0160.ckpt \
+-i /home/cvlabusers/Appaji/diffusion_policy/data/jgd/2026.05.06/23.17.10_train_diffusion_unet_hybrid_pnp_lego_image/checkpoints/epoch=0200-train_loss=0.0116.ckpt \
 --videogen \
---output-prefix 0_poorcritic
+--output-prefix 16_poorcritic
 
 """
 import sys
