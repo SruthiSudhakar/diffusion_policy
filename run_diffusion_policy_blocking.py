@@ -25,7 +25,7 @@ cd /home/cvlabusers/Appaji/diffusion_policy
 conda activate jgdrobodiff
 python run_diffusion_policy_blocking.py \
 -i /home/cvlabusers/Appaji/diffusion_policy/data/jgd/2026.05.06/23.17.10_train_diffusion_unet_hybrid_pnp_lego_image/checkpoints/epoch=0200-train_loss=0.0116.ckpt \
---output-prefix 0 --picked-up
+--output-prefix 0
 """
 import sys
 sys.stdout = open(sys.stdout.fileno(), mode='w', buffering=1)

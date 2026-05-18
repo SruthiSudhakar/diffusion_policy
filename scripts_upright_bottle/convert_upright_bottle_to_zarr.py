@@ -21,6 +21,7 @@ Output zarr structure:
     data/action: float32 (T_total, 7)        # leader_trajectory
 """
 import argparse
+import json
 import os
 import re
 import sys
@@ -41,9 +42,37 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 from diffusion_policy.common.replay_buffer import ReplayBuffer  # noqa: E402
 
+DEFAULT_LABEL_TO_PROMPT = {
+    'box': 'pick up the box',
+    'glass': 'pick up the glass',
+    'remote': 'pick up the remote',
+}
+
 
 def load_episode(npy_path: pathlib.Path):
     return np.load(npy_path, allow_pickle=True).item()
+
+
+def encode_label_prompts(label_to_prompt, model_name, device='cpu'):
+    """Run each unique prompt through a CLIP text encoder once.
+
+    Returns {label: np.ndarray of shape (D,) float32}.
+    """
+    import torch
+    from transformers import CLIPTokenizer, CLIPTextModel
+    tokenizer = CLIPTokenizer.from_pretrained(model_name)
+    # use_safetensors=True avoids torch.load(weights_only=...) which doesn't
+    # exist on torch<2.0 (this env has torch 1.12).
+    model = CLIPTextModel.from_pretrained(
+        model_name, use_safetensors=True).to(device).eval()
+    out = {}
+    with torch.no_grad():
+        for label, prompt in label_to_prompt.items():
+            tok = tokenizer([prompt], padding=True, return_tensors='pt').to(device)
+            emb = model(**tok).pooler_output[0].cpu().numpy().astype(np.float32)
+            out[label] = emb
+    del model
+    return out
 
 
 def main():
@@ -68,6 +97,15 @@ def main():
         help='inclusive lower bound on episode number')
     parser.add_argument('--episode-max', type=int, default=None,
         help='inclusive upper bound on episode number')
+    parser.add_argument('--clip-model', type=str,
+        default='openai/clip-vit-base-patch32',
+        help='HF model id for the CLIP text encoder used to build the '
+             'per-episode text conditioning. Default is 512-dim.')
+    parser.add_argument('--label-map', type=str, default=None,
+        help='JSON dict mapping {label: prompt}. Overrides the default '
+             'box/glass/remote -> "pick up the X" map.')
+    parser.add_argument('--no-text-cond', action='store_true', default=False,
+        help='skip CLIP text-embed computation (matches the pre-text zarr layout)')
     args = parser.parse_args()
 
     src = pathlib.Path(args.src)
@@ -81,11 +119,15 @@ def main():
 
     if args.prefixes:
         prefix_group = '|'.join(re.escape(p) for p in args.prefixes)
-        ep_re = re.compile(rf'^(?:{prefix_group})_(\d+)_')
+        ep_re = re.compile(rf'^({prefix_group})_(\d+)_')
 
         def ep_num(p):
             m = ep_re.match(p.name)
-            return int(m.group(1)) if m else None
+            return int(m.group(2)) if m else None
+
+        def ep_label(p):
+            m = ep_re.match(p.name)
+            return m.group(1) if m else None
 
         candidates = []
         for pref in args.prefixes:
@@ -101,6 +143,9 @@ def main():
         def ep_num(p):
             m = ep_re.match(p.name)
             return int(m.group(1)) if m else None
+
+        def ep_label(p):
+            return None
 
         all_npy = sorted(
             (p for p in src.glob(f'{prefix}*.npy') if ep_num(p) is not None),
@@ -130,11 +175,33 @@ def main():
         print(f'found {len(npy_files)} episodes (success_only={args.success_only}, '
               f'episode range=[{args.episode_min}, {args.episode_max}])')
 
+    text_cond_enabled = bool(args.prefixes) and not args.no_text_cond
+    if text_cond_enabled:
+        if args.label_map is not None:
+            label_to_prompt = json.loads(args.label_map)
+        else:
+            label_to_prompt = {p: DEFAULT_LABEL_TO_PROMPT.get(p, p)
+                               for p in args.prefixes}
+        missing = [p for p in args.prefixes if p not in label_to_prompt]
+        if missing:
+            raise SystemExit(f'label_map missing prompts for prefixes: {missing}')
+        print(f'CLIP text encoder: {args.clip_model}')
+        for k, v in label_to_prompt.items():
+            print(f'  {k!r:>10} -> {v!r}')
+        prompt_embeds = encode_label_prompts(label_to_prompt, args.clip_model)
+        text_embed_dim = next(iter(prompt_embeds.values())).shape[0]
+        print(f'CLIP text embed dim: {text_embed_dim}')
+    else:
+        prompt_embeds = {}
+        text_embed_dim = 0
+
     import zarr
     store = zarr.DirectoryStore(str(dst))
     buffer = ReplayBuffer.create_empty_zarr(storage=store)
 
     img_chunks = (1, target_h, target_w, 3)
+    episode_labels = []
+    episode_text_embeds = []
 
     for npy_path in tqdm(npy_files, desc='episodes'):
         ep = load_episode(npy_path)
@@ -169,6 +236,26 @@ def main():
             },
             chunks={'image1': img_chunks, 'image2': img_chunks},
         )
+        if text_cond_enabled:
+            label = ep_label(npy_path)
+            if label is None or label not in prompt_embeds:
+                raise RuntimeError(
+                    f'{npy_path.name}: could not derive a prompt label '
+                    f'(label={label!r}, known={list(prompt_embeds)})')
+            episode_labels.append(label)
+            episode_text_embeds.append(prompt_embeds[label])
+
+    if text_cond_enabled:
+        label_arr = np.array(episode_labels)            # fixed-width unicode
+        embed_arr = np.stack(episode_text_embeds).astype(np.float32)
+        buffer.update_meta({
+            'episode_labels': label_arr,
+            'episode_text_embed': embed_arr,
+        })
+        from collections import Counter
+        counts = Counter(episode_labels)
+        print(f'text conditioning: episode_text_embed{tuple(embed_arr.shape)}, '
+              f'label counts={dict(counts)}')
 
     print(f'done: n_episodes={buffer.n_episodes} n_steps={buffer.n_steps}')
     print(f'zarr at: {dst}')

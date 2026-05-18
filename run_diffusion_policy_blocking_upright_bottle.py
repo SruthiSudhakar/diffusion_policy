@@ -523,6 +523,14 @@ def make_recording_wrapper(grab_fn, stop_fn, video_path, fps):
                    '"exp1_<label>_<run_stamp>"). Default empty (no prefix).')
 @click.option('--picking-strategy', default='best', type=str,
               help='Picking strategy. "best" for best trajectory, "worst" for worst trajectory, "random" for random trajectory')
+@click.option('--prompt', default=None, type=str,
+              help='Text prompt used by text-conditioned policies (CLIP-embedded '
+                   'once at startup and tiled into the obs as text_embed every '
+                   'cycle). Required iff the loaded policy expects a text_embed '
+                   'obs key; ignored otherwise.')
+@click.option('--clip-model', default='openai/clip-vit-base-patch32', type=str,
+              help='HF model id for the CLIP text encoder. Must match the '
+                   'encoder used at zarr conversion time.')
 def main(ckpt_path, server_host, server_port,
          frequency, rs_width, rs_height, rs_fps,
          device, num_inference_steps, n_act_exec, scheduler, num_samples, oversample,
@@ -530,7 +538,7 @@ def main(ckpt_path, server_host, server_port,
          dry_run, record, record_jpeg_quality, video_fps, log_settle_err,
          max_steps,
          videogen, videogen_poll_sec, videogen_timeout_sec, videogen_hz, seed,
-         output_prefix, picking_strategy):
+         output_prefix, picking_strategy, prompt, clip_model):
     if num_samples < 1:
         raise click.BadParameter('--num-samples must be >= 1')
     if oversample == 0:
@@ -612,9 +620,40 @@ def main(ckpt_path, server_host, server_port,
             raise RuntimeError(
                 f'Policy normalizer is missing required key {k!r}. Found: {obs_keys}')
     use_state = 'state' in obs_keys
-    print(f'Policy obs keys: {obs_keys} (use_state={use_state})')
+    use_text = 'text_embed' in obs_keys
+    print(f'Policy obs keys: {obs_keys} (use_state={use_state}, use_text={use_text})')
     print(f'Camera mapping: image1 <- serial {CAM0_SERIAL} | '
           f'image2 <- serial {CAM1_SERIAL}')
+
+    text_embed_np = None
+    if use_text:
+        if not prompt:
+            raise click.BadParameter(
+                'Loaded policy expects a text_embed obs key but --prompt was not '
+                'supplied. Pass --prompt "pick up the box" (or similar).')
+        print(f'Encoding prompt with CLIP ({clip_model}): {prompt!r}')
+        from transformers import CLIPTokenizer, CLIPTextModel
+        _clip_tok = CLIPTokenizer.from_pretrained(clip_model)
+        # use_safetensors=True avoids torch.load(weights_only=...) which is
+        # not available on torch<2.0.
+        _clip_mdl = CLIPTextModel.from_pretrained(
+            clip_model, use_safetensors=True).to(device_t).eval()
+        with torch.no_grad():
+            _tok = _clip_tok([prompt], padding=True, return_tensors='pt').to(device_t)
+            text_embed_np = _clip_mdl(**_tok).pooler_output[0].cpu().numpy().astype(np.float32)
+        del _clip_mdl
+        # Cross-check dim against what the policy was trained with.
+        trained_dim = policy.normalizer.params_dict['text_embed']['scale'].shape[0]
+        # Identity normalizer stores a 1-element scale; in that case any dim is fine.
+        if trained_dim not in (1, text_embed_np.shape[0]):
+            raise RuntimeError(
+                f'CLIP embed dim {text_embed_np.shape[0]} does not match '
+                f'normalizer scale dim {trained_dim}. Wrong --clip-model?')
+        print(f'CLIP text embed: dim={text_embed_np.shape[0]} '
+              f'(first 5={text_embed_np[:5].tolist()})')
+    elif prompt:
+        print(f'WARNING: --prompt {prompt!r} supplied but policy has no text_embed '
+              'obs key; ignoring.')
 
     dt = 1.0 / frequency
 
@@ -779,6 +818,12 @@ def main(ckpt_path, server_host, server_port,
                 (oversample, n_obs, q_warm.shape[0]),
             ).copy()
             warm_obs['state'] = torch.from_numpy(st_warm).to(device_t)
+        if use_text:
+            txt_warm = np.broadcast_to(
+                text_embed_np[None, None, :],
+                (oversample, n_obs, text_embed_np.shape[0]),
+            ).copy()
+            warm_obs['text_embed'] = torch.from_numpy(txt_warm).to(device_t)
         _ = policy.predict_action(warm_obs)
 
     print(f'Starting blocking policy loop. n_obs={n_obs}, n_act={n_act}, '
@@ -849,6 +894,12 @@ def main(ckpt_path, server_host, server_port,
                 }
                 if use_state:
                     obs_t['state'] = torch.from_numpy(obs_state_np).to(device_t)
+                if use_text:
+                    obs_text_np = np.broadcast_to(
+                        text_embed_np[None, None, :],
+                        (oversample, n_obs, text_embed_np.shape[0]),
+                    ).copy()
+                    obs_t['text_embed'] = torch.from_numpy(obs_text_np).to(device_t)
                 pred = policy.predict_action(obs_t)
             actions_all = pred['action'].cpu().numpy()       # (M, n_act, 7)
             actions_full_all = pred['action_pred'].cpu().numpy()  # (M, horizon, 7)
