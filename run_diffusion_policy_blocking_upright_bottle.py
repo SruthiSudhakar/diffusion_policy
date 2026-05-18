@@ -68,11 +68,11 @@ cd /proj/vondrick3/sruthi/Appaji/diffusion_policy
 conda activate jgdrobodiff
 
 python run_diffusion_policy_blocking_upright_bottle.py \
--i /proj/vondrick3/sruthi/Appaji/diffusion_policy/data/jgd/2026.05.16/15.38.07_train_diffusion_unet_hybrid_bag_plate_text/checkpoints/epoch=0800-train_loss=0.0322.ckpt \
---prompt "pick up the box" \
+-i /home/cvlabusers/Appaji/diffusion_policy/data/jgd/2026.05.16/15.38.07_train_diffusion_unet_hybrid_bag_plate_text/checkpoints/epoch=0800-train_loss=0.0322.ckpt \
+--max-steps 64 \
+--pickup /home/cvlabusers/Appaji/i2rt/pickup_bag_2.npy \
 --output-prefix 0b \
---max-steps 64
-
+--prompt "pick up the glass"
 
 """
 import sys
@@ -542,6 +542,9 @@ def make_recording_wrapper(grab_fn, stop_fn, video_path, fps):
 @click.option('--clip-model', default='openai/clip-vit-base-patch32', type=str,
               help='HF model id for the CLIP text encoder. Must match the '
                    'encoder used at zarr conversion time.')
+@click.option('--winner-idx', default=0, type=int,
+              help='Index of the winner trajectory.')
+                   
 def main(ckpt_path, server_host, server_port,
          frequency, rs_width, rs_height, rs_fps,
          device, num_inference_steps, n_act_exec, scheduler, num_samples, oversample,
@@ -549,7 +552,7 @@ def main(ckpt_path, server_host, server_port,
          dry_run, record, record_jpeg_quality, video_fps, log_settle_err,
          max_steps,
          videogen, videogen_poll_sec, videogen_timeout_sec, videogen_hz, seed,
-         output_prefix, picking_strategy, prompt, clip_model):
+         output_prefix, picking_strategy, prompt, clip_model, winner_idx):
     if num_samples < 1:
         raise click.BadParameter('--num-samples must be >= 1')
     if oversample == 0:
@@ -944,7 +947,6 @@ def main(ckpt_path, server_host, server_port,
             # ---- 6b. Submit image2 + N trajectories to cv16, block on ranking.
             # Robot stays paused at the previous chunk's last waypoint until
             # the cv16 mp4s AND ranking.json for THIS cycle exist.
-            winner_idx = 0
             if videogen:
                 raw_bgr = get_raw_bgr2()
                 if videogen_hz == '15':
