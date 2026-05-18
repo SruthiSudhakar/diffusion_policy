@@ -63,6 +63,17 @@ python run_diffusion_policy_blocking_upright_bottle.py \
 -i /home/cvlabusers/Appaji/diffusion_policy/data/jgd/2026.05.15/18.12.31_train_diffusion_unet_hybrid_push_bowl_image_only_15hz/checkpoints/epoch=0250-train_loss=0.0188.ckpt \
 --output-prefix 1jgd \
 --videogen
+
+cd /proj/vondrick3/sruthi/Appaji/diffusion_policy
+conda activate jgdrobodiff
+
+python run_diffusion_policy_blocking_upright_bottle.py \
+-i /proj/vondrick3/sruthi/Appaji/diffusion_policy/data/jgd/2026.05.16/15.38.07_train_diffusion_unet_hybrid_bag_plate_text/checkpoints/epoch=0800-train_loss=0.0322.ckpt \
+--prompt "pick up the box" \
+--output-prefix 0b \
+--max-steps 64
+
+
 """
 import sys
 sys.stdout = open(sys.stdout.fileno(), mode='w', buffering=1)
