@@ -55,14 +55,13 @@ python run_diffusion_policy_blocking_upright_bottle.py \
 push bowl:
 
 python run_diffusion_policy_blocking_upright_bottle.py \
--i /home/cvlabusers/Appaji/diffusion_policy/data/jgd/2026.05.15/18.07.44_train_diffusion_unet_hybrid_push_bowl_image_only/checkpoints/epoch=0250-train_loss=0.0265.ckpt \
---videogen \
---output-prefix 1jgdsgd
+-i /home/cvlabusers/Appaji/diffusion_policy/data/jgd/2026.05.18/15.12.41_train_diffusion_unet_hybrid_push_bowl_image_only_trajectory/checkpoints/epoch=0250-train_loss=0.0247.ckpt \
+--output-prefix 1jgd \
+--videogen
 
 python run_diffusion_policy_blocking_upright_bottle.py \
--i /home/cvlabusers/Appaji/diffusion_policy/data/jgd/2026.05.15/18.12.31_train_diffusion_unet_hybrid_push_bowl_image_only_15hz/checkpoints/epoch=0250-train_loss=0.0188.ckpt \
---videogen \
---output-prefix 4
+-i /home/cvlabusers/Appaji/diffusion_policy/data/jgd/2026.05.15/18.07.44_train_diffusion_unet_hybrid_push_bowl_image_only/checkpoints/epoch=0250-train_loss=0.0265.ckpt \
+--output-prefix test
 """
 import sys
 sys.stdout = open(sys.stdout.fileno(), mode='w', buffering=1)
@@ -466,7 +465,7 @@ def make_recording_wrapper(grab_fn, stop_fn, video_path, fps):
                    'If set, these actions are executed back-to-back at the policy '
                    'rate at boot in place of the fixed start_pose ramp, and the '
                    'final pose becomes the starting pose for the rollout.')
-@click.option('--settle-sec', default=0.5, type=float,
+@click.option('--settle-sec', default=1.0, type=float,
               help='Extra wait after the last waypoint\'s target time before '
                    'capturing the next observation. Lets the interpolator '
                    'finish settling at the final pose.')
@@ -995,6 +994,17 @@ def main(ckpt_path, server_host, server_port,
         stop_reason = f'exception:{type(e).__name__}'
         raise
     finally:
+        # Capture one final observation after the last action has settled,
+        # before tearing down the cameras. grab1/grab2 are non-blocking when
+        # record=True (they read the latest cached frame from the recorder
+        # threads), so this is a snapshot of the post-rollout scene.
+        if record_dir is not None:
+            try:
+                save_obs(grab1(), grab2())
+                print(f'Saved final scene observation (frame_{frame_idx - 1:06d}) '
+                      f'to {obs_dir1.parent}')
+            except Exception as e:
+                print(f'Failed to capture final scene observation: {e!r}')
         stop_cameras()
         print(f'Run finished after {total_steps} action waypoints over '
               f'{cycle} cycles (stop_reason={stop_reason}).')

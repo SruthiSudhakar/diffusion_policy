@@ -210,9 +210,9 @@ TASK_ROOTS = {
     'pnp_lego':
         'data/jgd/2026.05.06/23.17.10_train_diffusion_unet_hybrid_pnp_lego_image/'
         'checkpoints/epoch=0200-train_loss=0.0116',
-    'bag_plate':
-        'data/jgd/2026.05.14/15.07.10_train_diffusion_unet_hybrid_bag_plate_image_only/'
-        'checkpoints/archive/epoch=0300-train_loss=0.0208',
+    # 'bag_plate':
+    #     'data/jgd/2026.05.14/15.07.10_train_diffusion_unet_hybrid_bag_plate_image_only/'
+    #     'checkpoints/archive/epoch=0300-train_loss=0.0208',
     'push_bowl':
         'data/jgd/2026.05.15/18.07.44_train_diffusion_unet_hybrid_push_bowl_image_only/'
         'checkpoints/epoch=0250-train_loss=0.0265',
@@ -301,20 +301,20 @@ def fig_variance_progression(out_path, base_dir=pathlib.Path('.'),
         axes = [axes]
     cmap = plt.get_cmap('tab10')
 
-    x = np.arange(1, n_buckets + 1)
-    x_labels = ['start', '', 'middle', '', 'end']
-
-    from matplotlib.ticker import FuncFormatter, LogLocator
-
-    def decimal_fmt(y, _pos):
-        if y >= 1:
-            return f'{y:.0f}'
-        # Drop trailing zeros: 0.10 -> 0.1, 0.020 -> 0.02
-        return ('%g' % y)
+    task_display = {
+        'pnp_lego': 'PnP Lego To Bowl',
+        'push_bowl': 'Push Bowl',
+    }
+    task_xmax = {
+        'pnp_lego': 240,
+        'push_bowl': 96,
+    }
 
     handles = []
     labels = []
     for ax, (task, avgs) in zip(axes, tasks_data.items()):
+        xmax = task_xmax.get(task, n_buckets)
+        x = np.linspace(0, xmax, n_buckets)
         for d in range(7):
             line, = ax.plot(x, avgs[:, d],
                             color=cmap(d), linewidth=2.0,
@@ -323,26 +323,17 @@ def fig_variance_progression(out_path, base_dir=pathlib.Path('.'),
             if ax is axes[0]:
                 handles.append(line)
                 labels.append(JOINT_LABELS[d])
-        ax.set_title(task, fontsize=12)
-        ax.set_xticks(x)
-        ax.set_xticklabels(x_labels)
-        ax.set_xlabel('rollout progression')
-        ax.set_yscale('log')
-        ax.yaxis.set_major_locator(LogLocator(base=10.0,
-                                              subs=(1.0, 2.0, 5.0),
-                                              numticks=12))
-        ax.yaxis.set_minor_locator(LogLocator(base=10.0,
-                                              subs=np.arange(2, 10) * 0.1,
-                                              numticks=12))
-        ax.yaxis.set_major_formatter(FuncFormatter(decimal_fmt))
-        ax.yaxis.set_minor_formatter(FuncFormatter(lambda *_: ''))
-        ax.grid(True, which='both', alpha=0.3)
+        ax.set_title(task_display.get(task, task), fontsize=12)
+        ax.set_xticks(np.linspace(0, xmax, n_buckets))
+        ax.set_xlabel('rollout cycle')
+        ax.grid(True, alpha=0.3)
         if ax is axes[0]:
-            ax.set_ylabel('avg sample variance (log scale)')
+            ax.set_ylabel('avg sample variance')
 
-    # Legend on the right of all plots.
-    fig.legend(handles, labels, loc='center left',
-               bbox_to_anchor=(1.005, 0.5),
+    # Legend below the plots.
+    fig.legend(handles, labels, loc='lower center',
+               bbox_to_anchor=(0.5, -0.02),
+               ncol=len(JOINT_LABELS),
                fontsize=10, frameon=False,
                title='joint')
     fig.suptitle(
@@ -350,7 +341,7 @@ def fig_variance_progression(out_path, base_dir=pathlib.Path('.'),
         'over 5 stages of the rollout',
         y=1.03, fontsize=12,
     )
-    fig.tight_layout(rect=[0, 0, 0.97, 1.0])
+    fig.tight_layout(rect=[0, 0.08, 1.0, 1.0])
     fig.savefig(out_path, bbox_inches='tight')
     plt.close(fig)
     summary = ', '.join(
