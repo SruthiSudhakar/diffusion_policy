@@ -20,17 +20,19 @@ Painted-template workflow:
      per-frame bowl footprint.
 
 
-python compute_rollout_iou.py \
---root <epoch_dir> \
---video image2 \
---target-mask target_mask.png \
---detector orb \
---bowl-template-frame data/jgd/2026.05.18/15.12.41_train_diffusion_unet_hybrid_push_bowl_image_only_trajectory/checkpoints/epoch=0250-train_loss=0.0247/37jgd_f_2026-05-19_16-42-24_VLM/observations/image2/frame_000000.jpg \
---bowl-template-mask bowl_mask.png \
---bowl-mask template \
---bowl-roi 180,100,540,310 \
---skip-frames 0 --stride 1 \
---save-overlay --workers 8
+  python compute_rollout_iou.py \
+    --root data/jgd/2026.05.18/15.12.41_train_diffusion_unet_hybrid_push_bowl_image_only_trajectory/checkpoints/epoch=0250-train_loss=0.0247 \
+    --video image2 \
+    --target-mask target_mask.png \
+    --detector hsv \
+    --hsv-low 80,100,30 --hsv-high 140,255,255 \
+    --bowl-template-frame data/jgd/2026.05.18/15.12.41_train_diffusion_unet_hybrid_push_bowl_image_only_trajectory/checkpoints/epoch=0250-train_loss=0.0247/10jgd_4s_2026-05-19_12-26-10/observations/image2/frame_000000.jpg \
+    --bowl-template-mask bowl_mask.png \
+    --bowl-mask template \
+    --bowl-roi 50,60,600,320 \
+    --min-bowl-area 10 \
+    --skip-frames 0 --stride 1 \
+    --save-overlay --workers 8
 
 """
 
