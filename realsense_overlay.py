@@ -7,7 +7,7 @@ in the workspace to match the original setup.
 
 Usage:
     python scripts_pnp_lego/realsense_overlay.py \
-        --ref /path/to/run/observations/frame_000000.jpg
+        /path/to/run/observations/frame_000000.jpg
 
 Keys:
     +/=    increase blend alpha (more reference)
@@ -32,7 +32,7 @@ WINDOW = "realsense overlay (q to quit)"
 
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--ref", required=True, help="Path to reference image to overlay (BGR JPEG/PNG).")
+    ap.add_argument("ref", help="Path to reference image to overlay (BGR JPEG/PNG).")
     ap.add_argument("--rs-width", type=int, default=1280)
     ap.add_argument("--rs-height", type=int, default=720)
     ap.add_argument("--rs-fps", type=int, default=30)
