@@ -62,6 +62,18 @@ python run_diffusion_policy_blocking_upright_bottle.py \
 python run_diffusion_policy_blocking_upright_bottle.py \
 -i /home/cvlabusers/Appaji/diffusion_policy/data/jgd/2026.05.15/18.07.44_train_diffusion_unet_hybrid_push_bowl_image_only/checkpoints/epoch=0250-train_loss=0.0265.ckpt \
 --output-prefix test
+
+stacking:
+python run_diffusion_policy_blocking_upright_bottle.py \
+-i /home/cvlabusers/Appaji/diffusion_policy/data/jgd/2026.05.19/23.23.21_train_diffusion_unet_hybrid_stacking_image_only_15hz/checkpoints/epoch=0200-train_loss=0.0180.ckpt \
+--pickup /home/cvlabusers/Appaji/i2rt/stackpick.npy \
+--output-prefix 1jgd \
+--videogen
+
+python run_diffusion_policy_blocking_upright_bottle.py \
+-i /home/cvlabusers/Appaji/diffusion_policy/data/jgd/2026.05.19/23.23.33_train_diffusion_unet_hybrid_stacking_image_10hz_wstate/checkpoints/epoch=0500-train_loss=0.0148.ckpt \
+--pickup /home/cvlabusers/Appaji/i2rt/stackpick.npy \
+--output-prefix 12jgd
 """
 import sys
 sys.stdout = open(sys.stdout.fileno(), mode='w', buffering=1)
@@ -433,7 +445,7 @@ def make_recording_wrapper(grab_fn, stop_fn, video_path, fps):
 @click.option('--device', default='auto', help="'auto' picks cuda:0 if available else cpu.")
 @click.option('--num-inference-steps', default=16, type=int,
               help='Diffusion sampling steps.')
-@click.option('--n-act-exec', default=0, type=int,
+@click.option('--n-act-exec', default=8, type=int,
               help='Number of actions to actually execute from each predicted '
                    'chunk of length n_action_steps (e.g. 16). 0 (default) means '
                    'execute the full chunk. Must be in [1, n_action_steps].')
@@ -506,7 +518,7 @@ def make_recording_wrapper(grab_fn, stop_fn, video_path, fps):
               help='How often to poll cv16 for the generated mp4s / ranking.json.')
 @click.option('--videogen-timeout-sec', default=1800.0, type=float,
               help='Hard ceiling per cycle. Exceeding raises (after holding pose).')
-@click.option('--videogen-hz', type=click.Choice(['15', '30', '60']), default='30',
+@click.option('--videogen-hz', type=click.Choice(['15', '30', '60']), default='60',
               help='Trajectory rate sent to the cv16 video model. 15 sends the '
                    "policy's native 15Hz waypoints (32 padded to 33). 30 (default) "
                    'linearly upsamples to 30Hz and sends the first 33 samples '
@@ -718,6 +730,9 @@ def main(ckpt_path, server_host, server_port,
         obs_dir1.mkdir(parents=True, exist_ok=True)
         obs_dir2.mkdir(parents=True, exist_ok=True)
         print(f'Recording observations to {record_dir / "observations"}')
+
+        with open(record_dir / 'args.json', 'w') as f:
+            json.dump(click.get_current_context().params, f, indent=2)
 
         # Start background video recorders. From here on grab1()/grab2() are
         # non-blocking and return the most recent frame each reader thread
