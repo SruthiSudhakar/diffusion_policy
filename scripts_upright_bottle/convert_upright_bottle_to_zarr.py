@@ -4,8 +4,8 @@ a diffusion_policy zarr ReplayBuffer.
 
 Source layout (per episode):
     <name>.npy              dict(
-        trajectory[T,7],            # ignored
-        leader_trajectory[T,7],     # used for both state and action
+        trajectory[T,7],            # follower (measured) -> state
+        leader_trajectory[T,7],     # leader (commanded)  -> action
         timestamps[T], frequency,
         image_paths_cam0[T],        # paths into <name>_frames_cam0/
         image_paths_cam1[T],        # paths into <name>_frames_cam1/
@@ -17,8 +17,8 @@ Output zarr structure:
     meta/episode_ends: int64 (N_episodes,)
     data/image1: uint8  (T_total, H, W, 3)   # cam0
     data/image2: uint8  (T_total, H, W, 3)   # cam1
-    data/state:  float32 (T_total, 7)        # leader_trajectory
-    data/action: float32 (T_total, 7)        # leader_trajectory
+    data/state:  float32 (T_total, 7)        # follower trajectory (observed)
+    data/action: float32 (T_total, 7)        # leader trajectory (commanded)
 """
 import argparse
 import os
@@ -138,16 +138,18 @@ def main():
 
     for npy_path in tqdm(npy_files, desc='episodes'):
         ep = load_episode(npy_path)
-        traj = ep['leader_trajectory']
+        action_traj = ep['leader_trajectory']
+        state_traj = ep['trajectory']
         image_paths_cam0 = ep['image_paths_cam0']
         image_paths_cam1 = ep['image_paths_cam1']
-        T = len(traj)
+        T = len(action_traj)
+        assert len(state_traj) == T, f'{npy_path.name}: state/action len mismatch'
         assert len(image_paths_cam0) == T, f'{npy_path.name}: cam0/traj len mismatch'
         assert len(image_paths_cam1) == T, f'{npy_path.name}: cam1/traj len mismatch'
 
         idx = np.arange(0, T, args.subsample)
-        traj_sub = traj[idx].astype(np.float32)
-        state_sub = traj_sub.copy()
+        action_sub = action_traj[idx].astype(np.float32)
+        state_sub = state_traj[idx].astype(np.float32)
 
         images_cam0 = np.empty((len(idx), target_h, target_w, 3), dtype=np.uint8)
         images_cam1 = np.empty((len(idx), target_h, target_w, 3), dtype=np.uint8)
@@ -165,7 +167,7 @@ def main():
                 'image1': images_cam0,
                 'image2': images_cam1,
                 'state': state_sub,
-                'action': traj_sub,
+                'action': action_sub,
             },
             chunks={'image1': img_chunks, 'image2': img_chunks},
         )

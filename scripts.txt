@@ -125,3 +125,60 @@ task.dataset_path=data/push_bowl/replay_subsample2.zarr \
 task.dataset.zarr_path=data/push_bowl/replay_subsample2.zarr \
 task.dataset.val_ratio=0.1 \
 'hydra.run.dir=data/jgd/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}_15hz'
+
+Stacking Task:
+One-time data conversion (10Hz = subsample 3, 15Hz = subsample 2):
+python scripts_upright_bottle/convert_upright_bottle_to_zarr.py \
+--src /proj/vondrick3/datasets/expert_data_jgd_stacking \
+--dst data/stacking/replay.zarr \
+--image-size 640 360 --subsample 3 --success-only
+
+python scripts_upright_bottle/convert_upright_bottle_to_zarr.py \
+--src /proj/vondrick3/datasets/expert_data_jgd_stacking \
+--dst data/stacking/replay_subsample2.zarr \
+--image-size 640 360 --subsample 2 --success-only
+
+Training 1 (Image1 + Image2 only, 10Hz / subsample 3):
+cd /proj/vondrick3/sruthi/Appaji/diffusion_policy
+conda activate jgdrobodiff
+cv11
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 OMP_NUM_THREADS=4 TOKENIZERS_PARALLELISM=false \
+accelerate launch --config_file accelerate_config.yaml --num_processes 8 \
+train.py --config-dir=. \
+--config-name=stacking_image_only_diffusion_policy_cnn.yaml \
+training.seed=42 \
+task.dataset_path=data/stacking/replay.zarr \
+task.dataset.zarr_path=data/stacking/replay.zarr \
+task.dataset.val_ratio=0.1 \
+training.num_epochs=1500 \
+'hydra.run.dir=data/jgd/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}_10hz'
+
+Training 2 (Image1 + Image2 only, 15Hz / subsample 2):
+cd /proj/vondrick3/sruthi/Appaji/diffusion_policy
+conda activate jgdrobodiff
+cv12
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 OMP_NUM_THREADS=4 TOKENIZERS_PARALLELISM=false \
+accelerate launch --config_file accelerate_config.yaml --num_processes 8 \
+train.py --config-dir=. \
+--config-name=stacking_image_only_diffusion_policy_cnn.yaml \
+training.seed=42 \
+task.dataset_path=data/stacking/replay_subsample2.zarr \
+task.dataset.zarr_path=data/stacking/replay_subsample2.zarr \
+task.dataset.val_ratio=0.1 \
+training.num_epochs=1500 \
+'hydra.run.dir=data/jgd/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}_15hz'
+
+Training 3 (Image1 + Image2 + State, 10Hz / subsample 3):
+cd /proj/vondrick3/sruthi/Appaji/diffusion_policy
+conda activate jgdrobodiff
+cv13
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 OMP_NUM_THREADS=4 TOKENIZERS_PARALLELISM=false \
+accelerate launch --config_file accelerate_config.yaml --num_processes 8 \
+train.py --config-dir=. \
+--config-name=stacking_image_diffusion_policy_cnn.yaml \
+training.seed=42 \
+task.dataset_path=data/stacking/replay.zarr \
+task.dataset.zarr_path=data/stacking/replay.zarr \
+task.dataset.val_ratio=0.1 \
+training.num_epochs=1500 \
+'hydra.run.dir=data/jgd/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}_10hz_wstate'
