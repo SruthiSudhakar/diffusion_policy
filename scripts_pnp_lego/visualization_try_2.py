@@ -347,33 +347,45 @@ def base_canvas():
     return img
 
 
-def grid_geometry(K, cols=3):
-    """Lay the K candidate videos out in a `cols`-wide grid.
+def grid_geometry(K, cols=3, rows_arrangement=None):
+    """Lay the K candidate videos out, label + vote bar reserved underneath.
 
-    Each cell holds the video on top and reserves LABEL_H underneath for its
-    "Sample k" label + vote bar. The thumbnail is sized as large as possible
-    inside its cell while keeping the 848:480 aspect ratio. Returns a list of
-    (thumb_x, thumb_y, thumb_w, thumb_h, cell_x0, cell_w) per candidate.
+    `rows_arrangement`, if given, is an explicit per-row count list (e.g.
+    [2, 1, 2] for 5 samples) summing to K; otherwise rows of `cols` are used.
+    All videos are sized uniformly as large as the tightest row allows while
+    keeping the 848:480 aspect ratio, and each row is centered horizontally.
+    Returns a list of (thumb_x, thumb_y, thumb_w, thumb_h, cell_x0, cell_w).
     """
-    cols = max(1, min(cols, K))
-    rows = int(np.ceil(K / cols))
+    if rows_arrangement and sum(rows_arrangement) == K:
+        arr = list(rows_arrangement)
+    else:
+        cols = max(1, min(cols, K))
+        arr, left = [], K
+        while left > 0:
+            arr.append(min(cols, left))
+            left -= min(cols, left)
+    R = len(arr)
     top = HEADER_H + PAD
     avail_w = RIGHT_X1 - RIGHT_X0
     avail_h = H - top - PAD
     gx, gy = 20, 14
-    cell_w = (avail_w - (cols - 1) * gx) / cols
-    cell_h = (avail_h - (rows - 1) * gy) / rows
-    th_box = cell_h - LABEL_H
-    s = min(cell_w / 848.0, th_box / 480.0)
+    row_h = (avail_h - (R - 1) * gy) / R
+    th_box = row_h - LABEL_H
+    # uniform video size: limited by the widest row (width) and row height
+    max_c = max(arr)
+    cell_w_min = (avail_w - (max_c - 1) * gx) / max_c
+    s = min(cell_w_min / 848.0, th_box / 480.0)
     tw, th = int(848 * s), int(480 * s)
     geo = []
-    for k in range(K):
-        r, c = k // cols, k % cols
-        cx0 = RIGHT_X0 + c * (cell_w + gx)
-        y0 = top + r * (cell_h + gy)
-        tx = int(cx0 + (cell_w - tw) / 2)  # center video in its cell
-        ty = int(y0)
-        geo.append((tx, ty, tw, th, int(cx0), int(cell_w)))
+    k = 0
+    for r, c in enumerate(arr):
+        row_w = c * tw + (c - 1) * gx
+        x_start = RIGHT_X0 + (avail_w - row_w) / 2  # center this row
+        y0 = top + r * (row_h + gy)
+        for j in range(c):
+            tx = int(x_start + j * (tw + gx))
+            geo.append((tx, int(y0), tw, th, tx, tw))
+            k += 1
     return geo
 
 
@@ -609,9 +621,14 @@ def main():
                          "frame after the play-through before pairwise ranking "
                          "begins.")
     ap.add_argument("--grid_cols", type=int, default=3,
-                    help="number of columns in the candidate-video grid "
-                         "(default 3, e.g. 5 samples -> 3x2 grid). Larger "
-                         "videos than a single vertical stack.")
+                    help="columns in the candidate-video grid, used when "
+                         "--grid_rows does not apply (e.g. 10 samples -> 3 "
+                         "cols). Fewer columns => bigger, wider videos.")
+    ap.add_argument("--grid_rows", default="2,1,2",
+                    help="explicit per-row sample counts, comma-separated "
+                         "(default '2,1,2' for 5 samples -> big videos). Used "
+                         "only when it sums to the number of samples; otherwise "
+                         "falls back to --grid_cols. Pass '' to always use cols.")
     ap.add_argument("--exec_pad_pre", type=float, default=0.25,
                     help="seconds of real-time lead-in before each detected "
                          "execution burst")
@@ -706,13 +723,20 @@ def main():
     cap = cv2.VideoCapture(str(rollout_path))
     cur_idx = 0
     total_out = 0
+    rows_arr = None
+    if args.grid_rows.strip():
+        try:
+            rows_arr = [int(x) for x in args.grid_rows.split(",") if x.strip()]
+        except ValueError:
+            print(f"[warn] could not parse --grid_rows '{args.grid_rows}'; "
+                  f"using --grid_cols {args.grid_cols}")
     K0 = len(glob.glob(os.path.join(steps[0], "*.mp4")))
-    geo = grid_geometry(max(1, K0), args.grid_cols)
+    geo = grid_geometry(max(1, K0), args.grid_cols, rows_arr)
 
     for si, step_dir in enumerate(steps):
         ranking, cand = load_step(step_dir)
         K = len(cand)
-        geo = grid_geometry(K, args.grid_cols)
+        geo = grid_geometry(K, args.grid_cols, rows_arr)
         votes_final = ranking.get("votes", [0] * K)
         winner_idx = int(ranking.get("winner_idx", int(np.argmax(votes_final))))
         pairs = ranking.get("pairs", [])
