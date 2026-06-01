@@ -501,30 +501,16 @@ class Writer:
 # ---------------------------------------------------------------------------
 # Right-panel state plan for one (sped-up) pause region
 # ---------------------------------------------------------------------------
-def build_pause_states(n_out, pairs, votes_final, winner_idx, K,
-                       gen_frac=0.22, rank_frac=0.62, gen_frames=None,
-                       executed=True):
-    """Return a list of `n_out` right-panel state dicts for one pause region.
+def build_pause_states(pairs, votes_final, winner_idx, K, n_gen, n_win,
+                       pair_frames, n_out=None, executed=True):
+    """Return the list of right-panel state dicts for one pause region.
 
-    The pause region is split into three sub-phases whose lengths sum to
-    n_out: generation (candidates play, no votes) -> pairwise ranking (pairs
-    revealed one-by-one, running tally grows) -> winner reveal. Each output
-    frame gets a dict telling `compose` what to draw.
-
-    `gen_frames`, if given, forces the generation sub-phase to be at least that
-    many output frames (used to hold ranking off until the candidate clips have
-    finished their single play-through and are frozen on their last frame).
+    The pause is three sub-phases concatenated: generation (`n_gen` frames,
+    candidates playing, no votes) -> pairwise ranking (each pair pi shown for
+    `pair_frames[pi]` output frames with a growing running tally) -> winner
+    reveal (`n_win` frames). The natural length is the sum of those; if `n_out`
+    is given and larger, the winner reveal is held to pad up to `n_out`.
     """
-    n_out = max(1, n_out)
-    n_gen = max(1, int(round(n_out * gen_frac)))
-    if gen_frames is not None:
-        n_gen = max(n_gen, int(gen_frames))
-    n_gen = min(n_gen, n_out - 1)
-    rem = n_out - n_gen
-    # winner reveal keeps >=1 frame when there's room; ranking takes the rest
-    n_rank = max(1, min(int(round(n_out * rank_frac)), rem - 1 if rem > 1 else rem))
-    n_win = max(0, rem - n_rank)
-
     states = []
 
     # phase 1: generation
@@ -534,35 +520,24 @@ def build_pause_states(n_out, pairs, votes_final, winner_idx, K,
             phase_color=ACCENT, votes=None, active_pair=None, verdict=None,
             winner_idx=None, dim_losers=False))
 
-    # phase 2: pairwise ranking with running tally
+    # phase 2: pairwise ranking with a growing running tally; each pair lingers
+    # for its own pair_frames[pi] output frames.
     P = len(pairs)
-    running = [0] * K
     if P > 0:
-        # assign each output frame to a pair index (monotonic)
-        for t in range(n_rank):
-            pi = min(P - 1, int(t * P / n_rank))
-            # running tally reflects all pairs up to and including pi
+        for pi, pr in enumerate(pairs):
             tally = [0] * K
             for q in range(pi + 1):
                 tally[int(pairs[q]["winner"])] += 1
-            pr = pairs[pi]
             i, j, w = int(pr["i"]), int(pr["j"]), int(pr["winner"])
             loser = j if w == i else i
-            states.append(dict(
+            st = dict(
                 phase=f"VLM pairwise ranking  ({pi + 1}/{P})   "
                       f"Sample {i} vs Sample {j}  ->  Sample {w} wins",
                 phase_color=HILITE, votes=tally, active_pair=(i, j),
                 verdict={w: "win", loser: "lose"}, winner_idx=None,
-                dim_losers=False))
-        running = [0] * K
-        for pr in pairs:
-            running[int(pr["winner"])] += 1
-    else:
-        for _ in range(n_rank):
-            states.append(dict(phase="VLM ranking", phase_color=HILITE,
-                               votes=list(votes_final), active_pair=None,
-                               verdict=None, winner_idx=None, dim_losers=False))
-        running = list(votes_final)
+                dim_losers=False)
+            for _ in range(max(0, int(pair_frames[pi]))):
+                states.append(st)
 
     # phase 3: winner reveal
     tail = ("executing on robot" if executed
@@ -574,12 +549,15 @@ def build_pause_states(n_out, pairs, votes_final, winner_idx, K,
             phase_color=WIN, votes=list(votes_final), active_pair=None,
             verdict=None, winner_idx=winner_idx, dim_losers=True))
 
-    # pad/truncate to exactly n_out
-    while len(states) < n_out:
-        states.append(states[-1] if states else dict(
-            phase="", phase_color=ACCENT, votes=None, active_pair=None,
-            verdict=None, winner_idx=None, dim_losers=False))
-    return states[:n_out]
+    if not states:
+        states.append(dict(phase="", phase_color=ACCENT, votes=None,
+                           active_pair=None, verdict=None, winner_idx=None,
+                           dim_losers=False))
+    # hold the last (winner) frame to pad up to n_out when requested
+    target = len(states) if n_out is None else max(n_out, len(states))
+    while len(states) < target:
+        states.append(states[-1])
+    return states
 
 
 # ---------------------------------------------------------------------------
@@ -620,6 +598,18 @@ def main():
                     help="seconds the candidate clips stay frozen on their last "
                          "frame after the play-through before pairwise ranking "
                          "begins.")
+    ap.add_argument("--slow_pairs", type=int, default=2,
+                    help="number of leading comparisons on the FIRST step that "
+                         "get the slow --slow_comparisons duration.")
+    ap.add_argument("--slow_comparisons", type=float, default=5.0,
+                    help="seconds each of the first --slow_pairs comparisons "
+                         "lingers, ON THE FIRST STEP ONLY (default 5s).")
+    ap.add_argument("--fast_comparisons", type=float, default=0.35,
+                    help="seconds each fast comparison lasts: the remaining "
+                         "comparisons on step 1, and ALL comparisons on later "
+                         "steps.")
+    ap.add_argument("--winner_sec", type=float, default=1.2,
+                    help="seconds the winner reveal is shown before execution.")
     ap.add_argument("--grid_cols", type=int, default=3,
                     help="columns in the candidate-video grid, used when "
                          "--grid_rows does not apply (e.g. 10 samples -> 3 "
@@ -634,12 +624,6 @@ def main():
                          "execution burst")
     ap.add_argument("--exec_pad_post", type=float, default=0.6,
                     help="seconds of real-time settle shown after each burst")
-    ap.add_argument("--gen_frac", type=float, default=0.30,
-                    help="fraction of each sped-up pause spent on the "
-                         "'generating candidates' sub-phase")
-    ap.add_argument("--rank_frac", type=float, default=0.65,
-                    help="fraction of each sped-up pause spent revealing the "
-                         "pairwise rankings")
     ap.add_argument("--max_steps", type=int, default=None,
                     help="only render the first N steps (debug)")
     ap.add_argument("--camera", default="image2",
@@ -744,37 +728,66 @@ def main():
 
         # ---------- PAUSE region: left sped up, right = gen/rank/winner ----------
         pause_len = es - ps
-        n_out = max(1, int(np.ceil(pause_len / max(1, args.pause_speedup))))
-        # generation sub-phase must last at least one full 0.5x play-through of
-        # the longest candidate clip (+ a short frozen hold) so the pairwise
-        # ranking only starts once every clip is paused on its last frame.
+        # generation sub-phase lasts one full 0.5x play-through of the longest
+        # candidate clip (+ a short frozen hold) so ranking only starts once
+        # every clip is paused on its last frame.
         max_clip = max((len(c) for c in cand), default=1)
         play_once = int(np.ceil((max_clip - 1) * fps
                                 / (CAND_SRC_FPS * max(1e-6, args.cand_speed))))
-        gen_frames = play_once + int(round(args.gen_hold * fps))
-        states = build_pause_states(n_out, pairs, votes_final, winner_idx, K,
-                                    gen_frac=args.gen_frac,
-                                    rank_frac=args.rank_frac,
-                                    gen_frames=gen_frames, executed=has_exec)
-        # collect the kept (every-Nth) source frames for the left panel
+        n_gen = play_once + int(round(args.gen_hold * fps))
+        # explicit per-comparison durations. On the FIRST step the first
+        # --slow_pairs comparisons each linger for --slow_comparisons seconds;
+        # every other comparison (and all comparisons on later steps) lasts
+        # --fast_comparisons seconds.
+        slow_f = max(1, int(round(args.slow_comparisons * fps)))
+        fast_f = max(1, int(round(args.fast_comparisons * fps)))
+        P = len(pairs)
+        if si == 0:
+            pair_frames = [slow_f if pi < args.slow_pairs else fast_f
+                           for pi in range(P)]
+        else:
+            pair_frames = [fast_f] * P
+        n_win = max(1, int(round(args.winner_sec * fps)))
+        # narration length drives the pause; if the real pause is longer than
+        # 10x of it, we'd be too fast, so take whichever is longer and sample
+        # the (static) robot frames to fit.
+        narration = n_gen + sum(pair_frames) + n_win
+        n_out = max(narration,
+                    int(np.ceil(pause_len / max(1, args.pause_speedup))))
+        states = build_pause_states(pairs, votes_final, winner_idx, K, n_gen,
+                                    n_win, pair_frames, n_out=n_out,
+                                    executed=has_exec)
+        n_out = len(states)
+        # sample exactly n_out source frames across the pause (monotonic,
+        # forward-only); reuse the last read when n_out exceeds pause_len.
         left_frames = []
-        kept_target = set(ps + k * args.pause_speedup for k in range(n_out))
-        while cur_idx <= es - 1:
+        last_rgb = None
+        if pause_len > 0:
+            targets = [ps + (i * pause_len) // n_out for i in range(n_out)]
+            for s in targets:
+                while cur_idx <= s:
+                    ok, f = cap.read()
+                    if not ok:
+                        break
+                    last_rgb = cv2.cvtColor(cv2.resize(f, (640, 360)),
+                                            cv2.COLOR_BGR2RGB)
+                    cur_idx += 1
+                left_frames.append(last_rgb if last_rgb is not None
+                                   else np.full((360, 640, 3), 40, np.uint8))
+        # advance to the execution start so the exec region reads correctly
+        while cur_idx < es:
             ok, f = cap.read()
             if not ok:
                 break
-            idx = cur_idx
             cur_idx += 1
-            if idx in kept_target:
-                left_frames.append(cv2.cvtColor(cv2.resize(f, (640, 360)),
-                                                cv2.COLOR_BGR2RGB))
         if not left_frames:
             left_frames = [np.full((360, 640, 3), 40, np.uint8)]
+        eff_speed = max(1, int(round(pause_len / max(1, n_out))))
         for t in range(n_out):
             st = states[t]
             lf = left_frames[min(t, len(left_frames) - 1)]
             frame = compose(
-                lf, f"Generating + ranking — {args.pause_speedup}x speed up",
+                lf, f"Generating + ranking — {eff_speed}x speed up",
                 cand_frame(cand, K, t, fps, speed=args.cand_speed), geo,
                 st["phase"], st["phase_color"], st["votes"], st["active_pair"],
                 st["verdict"], st["winner_idx"], st["dim_losers"])
