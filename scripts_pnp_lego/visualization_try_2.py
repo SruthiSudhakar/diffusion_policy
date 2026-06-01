@@ -546,12 +546,18 @@ def build_pause_states(n_out, pairs, votes_final, winner_idx, K,
 # ---------------------------------------------------------------------------
 # Main assembly
 # ---------------------------------------------------------------------------
-def cand_frame(cand, K, anim_t, out_fps, src_fps=24.0):
-    """Looping candidate frame for each sample at global anim counter anim_t."""
+def cand_frame(cand, K, t_out, out_fps, speed=0.5, src_fps=24.0):
+    """Candidate frame for each sample at pause-region output index t_out.
+
+    Plays each generated clip through exactly once at `speed` (0.5 = half
+    speed) starting at the top of the pause region, then holds on the last
+    frame for the rest of the pause (so the pairwise ranking proceeds over a
+    frozen still rather than a looping clip).
+    """
     out = []
     for k in range(K):
         n = max(1, len(cand[k]))
-        src = int((anim_t / out_fps) * src_fps) % n
+        src = min(n - 1, int((t_out / out_fps) * src_fps * speed))
         out.append(cand[k][src])
     return out
 
@@ -567,6 +573,10 @@ def main():
     ap.add_argument("--pause_speedup", type=int, default=10,
                     help="play paused (generation/ranking) stretches this many "
                          "times faster. Execution bursts always play at 1x.")
+    ap.add_argument("--cand_speed", type=float, default=0.5,
+                    help="playback speed of the generated candidate clips "
+                         "(0.5 = half speed). Each clip plays through once then "
+                         "freezes on its last frame while ranking proceeds.")
     ap.add_argument("--exec_pad_pre", type=float, default=0.25,
                     help="seconds of real-time lead-in before each detected "
                          "execution burst")
@@ -698,7 +708,7 @@ def main():
             lf = left_frames[min(t, len(left_frames) - 1)]
             frame = compose(
                 lf, f"Generating + ranking — {args.pause_speedup}x speed up",
-                cand_frame(cand, K, t, fps), geo, row_h,
+                cand_frame(cand, K, t, fps, speed=args.cand_speed), geo, row_h,
                 st["phase"], st["phase_color"], st["votes"], st["active_pair"],
                 st["verdict"], st["winner_idx"], st["dim_losers"])
             writer.write(frame)
