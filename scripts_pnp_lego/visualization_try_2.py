@@ -74,9 +74,11 @@ HILITE = (250, 205, 70)       # yellow: active comparison
 
 # Left (real robot) panel
 LEFT_X0, LEFT_X1 = PAD, 744
-# Right region: vertically stacked candidate rows + ranking
+# Right region: grid of candidate videos + ranking
 RIGHT_X0 = 762
 RIGHT_X1 = W - PAD
+# vertical space reserved under each candidate video for its label + vote bar
+LABEL_H = 52
 
 
 # ---------------------------------------------------------------------------
@@ -345,22 +347,34 @@ def base_canvas():
     return img
 
 
-def row_geometry(n_rows):
-    """Per-row (y0, thumb_x, thumb_y, thumb_w, thumb_h, text_x)."""
+def grid_geometry(K, cols=3):
+    """Lay the K candidate videos out in a `cols`-wide grid.
+
+    Each cell holds the video on top and reserves LABEL_H underneath for its
+    "Sample k" label + vote bar. The thumbnail is sized as large as possible
+    inside its cell while keeping the 848:480 aspect ratio. Returns a list of
+    (thumb_x, thumb_y, thumb_w, thumb_h, cell_x0, cell_w) per candidate.
+    """
+    cols = max(1, min(cols, K))
+    rows = int(np.ceil(K / cols))
     top = HEADER_H + PAD
-    avail = H - top - PAD
-    row_h = avail / n_rows
-    thumb_h = int(min(row_h - 8, (RIGHT_X1 - RIGHT_X0) * 0.20 * 480 / 848))
-    thumb_h = max(40, thumb_h)
-    thumb_w = int(round(thumb_h * 848.0 / 480.0))
-    thumb_x = RIGHT_X0
-    text_x = thumb_x + thumb_w + 16
+    avail_w = RIGHT_X1 - RIGHT_X0
+    avail_h = H - top - PAD
+    gx, gy = 20, 14
+    cell_w = (avail_w - (cols - 1) * gx) / cols
+    cell_h = (avail_h - (rows - 1) * gy) / rows
+    th_box = cell_h - LABEL_H
+    s = min(cell_w / 848.0, th_box / 480.0)
+    tw, th = int(848 * s), int(480 * s)
     geo = []
-    for i in range(n_rows):
-        y0 = int(top + i * row_h)
-        ty = int(y0 + (row_h - thumb_h) / 2)
-        geo.append((y0, thumb_x, ty, thumb_w, thumb_h, text_x))
-    return geo, row_h
+    for k in range(K):
+        r, c = k // cols, k % cols
+        cx0 = RIGHT_X0 + c * (cell_w + gx)
+        y0 = top + r * (cell_h + gy)
+        tx = int(cx0 + (cell_w - tw) / 2)  # center video in its cell
+        ty = int(y0)
+        geo.append((tx, ty, tw, th, int(cx0), int(cell_w)))
+    return geo
 
 
 def draw_left(img, left_frame, label, tl):
@@ -374,15 +388,15 @@ def draw_left(img, left_frame, label, tl):
     tl.add((LEFT_X0 + 6, y0 + box_h + 4), label, 22, SUBTLE, bold=True)
 
 
-def compose(left_frame, left_label, cand_imgs, geo, row_h, phase, phase_color,
+def compose(left_frame, left_label, cand_imgs, geo, phase, phase_color,
             votes, active_pair, verdict, winner_idx, dim_losers):
     """Render one output frame.
 
     votes        : running tally list[int] (len K) or None
     active_pair  : (i, j) currently being compared, or None
     verdict      : {idx: 'win'|'lose'} for the active pair, or None
-    winner_idx   : highlight this row green (final), or None
-    dim_losers   : dim all non-winner rows
+    winner_idx   : highlight this cell green (final), or None
+    dim_losers   : dim all non-winner cells
     """
     img = base_canvas()
     tl = TextLayer(img)
@@ -400,9 +414,8 @@ def compose(left_frame, left_label, cand_imgs, geo, row_h, phase, phase_color,
 
     K = len(cand_imgs)
     max_votes = max(votes) if (votes and max(votes) > 0) else 1
-    bar_x1 = RIGHT_X1 - 64
     for k in range(K):
-        y0, tx, ty, tw, th, txt_x = geo[k]
+        tx, ty, tw, th, cx0, cw = geo[k]
         is_active = active_pair is not None and k in active_pair
         is_winner = winner_idx is not None and k == winner_idx
 
@@ -418,24 +431,26 @@ def compose(left_frame, left_label, cand_imgs, geo, row_h, phase, phase_color,
             bcol, bt = HILITE, 3
         border_rect(img, tx, ty, tx + tw, ty + th, bcol, bt)
 
+        # ---- label + vote bar underneath the video ----
         lab_col = WIN if is_winner else (HILITE if is_active else TEXT)
-        tl.add((txt_x, ty + 1), f"Sample {k}", 22, lab_col, bold=True)
-
-        if votes is not None:
-            bx0 = txt_x
-            by0 = ty + 30
-            by1 = min(ty + th, by0 + 22)
-            fill_rect(img, bx0, by0, bar_x1, by1, BAR_BG)
-            frac = votes[k] / max_votes
-            fcol = WIN if is_winner else ACCENT
-            fill_rect(img, bx0, by0, bx0 + int((bar_x1 - bx0) * frac), by1, fcol)
-            tl.add((bar_x1 + 8, by0 - 2), str(votes[k]), 20, TEXT, bold=True)
+        uy = ty + th + 5
+        tl.add((tx, uy), f"Sample {k}", 21, lab_col, bold=True)
 
         if verdict is not None and k in verdict:
             v = verdict[k]
             tag = "WIN" if v == "win" else "lose"
             tcol = WIN if v == "win" else LOSE
-            tl.add((RIGHT_X1 - 6, ty + 1), tag, 20, tcol, bold=True, anchor="ra")
+            tl.add((tx + tw, uy), tag, 20, tcol, bold=True, anchor="ra")
+
+        if votes is not None:
+            bx0, bx1 = tx, tx + tw - 36
+            by0 = uy + 27
+            by1 = by0 + 16
+            fill_rect(img, bx0, by0, bx1, by1, BAR_BG)
+            frac = votes[k] / max_votes
+            fcol = WIN if is_winner else ACCENT
+            fill_rect(img, bx0, by0, bx0 + int((bx1 - bx0) * frac), by1, fcol)
+            tl.add((bx1 + 6, by0 - 3), str(votes[k]), 19, TEXT, bold=True)
 
     return tl.flush()
 
@@ -593,6 +608,10 @@ def main():
                     help="seconds the candidate clips stay frozen on their last "
                          "frame after the play-through before pairwise ranking "
                          "begins.")
+    ap.add_argument("--grid_cols", type=int, default=3,
+                    help="number of columns in the candidate-video grid "
+                         "(default 3, e.g. 5 samples -> 3x2 grid). Larger "
+                         "videos than a single vertical stack.")
     ap.add_argument("--exec_pad_pre", type=float, default=0.25,
                     help="seconds of real-time lead-in before each detected "
                          "execution burst")
@@ -688,12 +707,12 @@ def main():
     cur_idx = 0
     total_out = 0
     K0 = len(glob.glob(os.path.join(steps[0], "*.mp4")))
-    geo, row_h = row_geometry(max(1, K0))
+    geo = grid_geometry(max(1, K0), args.grid_cols)
 
     for si, step_dir in enumerate(steps):
         ranking, cand = load_step(step_dir)
         K = len(cand)
-        geo, row_h = row_geometry(K)
+        geo = grid_geometry(K, args.grid_cols)
         votes_final = ranking.get("votes", [0] * K)
         winner_idx = int(ranking.get("winner_idx", int(np.argmax(votes_final))))
         pairs = ranking.get("pairs", [])
@@ -732,7 +751,7 @@ def main():
             lf = left_frames[min(t, len(left_frames) - 1)]
             frame = compose(
                 lf, f"Generating + ranking — {args.pause_speedup}x speed up",
-                cand_frame(cand, K, t, fps, speed=args.cand_speed), geo, row_h,
+                cand_frame(cand, K, t, fps, speed=args.cand_speed), geo,
                 st["phase"], st["phase_color"], st["votes"], st["active_pair"],
                 st["verdict"], st["winner_idx"], st["dim_losers"])
             writer.write(frame)
@@ -748,7 +767,7 @@ def main():
             lf = cv2.cvtColor(cv2.resize(f, (640, 360)), cv2.COLOR_BGR2RGB)
             frame = compose(
                 lf, f"Executing Sample {winner_idx}",
-                win_cand_last, geo, row_h,
+                win_cand_last, geo,
                 f"Executing chosen action (Sample {winner_idx}) on the real robot",
                 WIN, list(votes_final), None, None, winner_idx, True)
             writer.write(frame)
