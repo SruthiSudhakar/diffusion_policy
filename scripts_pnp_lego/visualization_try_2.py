@@ -175,6 +175,28 @@ class TextLayer:
 # ---------------------------------------------------------------------------
 # Data discovery / loading
 # ---------------------------------------------------------------------------
+def resolve_rollout(run_dir, camera, override):
+    """Find the real-robot rollout video.
+
+    Priority: explicit ``--rollout`` > ``rollout_<camera>.mp4`` > flat
+    ``rollout.mp4`` > any ``rollout_*.mp4`` in the dir. Single-camera runs write
+    ``rollout.mp4``; two-camera runs write ``rollout_image1.mp4`` /
+    ``rollout_image2.mp4``.
+    """
+    if override:
+        return (override if os.path.isabs(override)
+                else os.path.join(run_dir, override))
+    cands = []
+    if camera:
+        cands.append(os.path.join(run_dir, f"rollout_{camera}.mp4"))
+    cands.append(os.path.join(run_dir, "rollout.mp4"))
+    for c in cands:
+        if os.path.exists(c):
+            return c
+    g = sorted(glob.glob(os.path.join(run_dir, "rollout_*.mp4")))
+    return g[0] if g else cands[-1]
+
+
 def discover_steps(run_dir):
     """Sorted videogen step dirs that contain a ranking.json (one per step)."""
     vg = os.path.join(run_dir, "videogen")
@@ -449,7 +471,7 @@ class Writer:
 # Right-panel state plan for one (sped-up) pause region
 # ---------------------------------------------------------------------------
 def build_pause_states(n_out, pairs, votes_final, winner_idx, K,
-                       gen_frac=0.22, rank_frac=0.62):
+                       gen_frac=0.22, rank_frac=0.62, executed=True):
     """Return a list of `n_out` right-panel state dicts for one pause region.
 
     The pause region is split into three sub-phases whose lengths sum to
@@ -504,10 +526,12 @@ def build_pause_states(n_out, pairs, votes_final, winner_idx, K,
         running = list(votes_final)
 
     # phase 3: winner reveal
+    tail = ("executing on robot" if executed
+            else "run ended before execution")
     for _ in range(n_win):
         states.append(dict(
             phase=f"VLM chose Sample {winner_idx}  (votes: "
-                  f"{votes_final[winner_idx]})  ->  executing on robot",
+                  f"{votes_final[winner_idx]})  ->  {tail}",
             phase_color=WIN, votes=list(votes_final), active_pair=None,
             verdict=None, winner_idx=winner_idx, dim_losers=True))
 
@@ -554,15 +578,26 @@ def main():
     ap.add_argument("--rank_frac", type=float, default=0.65,
                     help="fraction of each sped-up pause spent revealing the "
                          "pairwise rankings")
-    ap.add_argument("--max_steps", type=int, default=2,
+    ap.add_argument("--max_steps", type=int, default=None,
                     help="only render the first N steps (debug)")
-    ap.add_argument("--rollout", default=None, help="explicit rollout mp4 path")
+    ap.add_argument("--camera", default="image2",
+                    help="which camera to show for two-camera runs "
+                         "(rollout_<camera>.mp4). Ignored when a flat "
+                         "rollout.mp4 exists.")
+    ap.add_argument("--rollout", default=None,
+                    help="explicit rollout mp4 path (overrides --camera lookup)")
     args = ap.parse_args()
 
     run_dir = args.run_dir
-    rollout_path = args.rollout or os.path.join(run_dir, "rollout.mp4")
-    out_path = args.out or os.path.join(run_dir, "visualization_try_2.mp4")
+    rollout_path = resolve_rollout(run_dir, args.camera, args.rollout)
     assert os.path.exists(rollout_path), f"rollout not found: {rollout_path}"
+    if args.out:
+        out_path = args.out
+    else:
+        # camera-aware default name so two-camera runs don't clobber each other
+        roll_stem = os.path.splitext(os.path.basename(rollout_path))[0]
+        suffix = roll_stem[len("rollout"):]  # "" or "_image2"
+        out_path = os.path.join(run_dir, f"visualization_try_2{suffix}.mp4")
 
     all_steps = discover_steps(run_dir)
     n_all = len(all_steps)
@@ -584,31 +619,46 @@ def main():
     sig, fps_in, nframes = robust_motion_signal(rollout_path)
     bursts = find_execution_bursts(sig, fps_in, n_expected=n_all)
     bursts = bursts[:n_steps]
-    if len(bursts) != n_steps:
-        print(f"[warn] detected {len(bursts)} bursts but have {n_steps} steps; "
-              f"pairing the first {min(len(bursts), n_steps)} in order")
-    n_use = min(len(bursts), n_steps)
-    bursts = bursts[:n_use]
+    n_burst = len(bursts)
+    if n_burst != n_steps:
+        print(f"[warn] detected {n_burst} execution burst(s) but have {n_steps} "
+              f"step(s). Steps {n_burst}..{n_steps - 1} were generated/ranked but "
+              f"never executed (run stopped) -> shown as pause-only segments.")
 
     pad_pre = int(args.exec_pad_pre * fps_in)
     pad_post = int(args.exec_pad_post * fps_in)
     # Build, per step, the [pause_region) and [exec_region] frame spans that
-    # together tile the rollout. exec_start is tightened back by pad_pre,
-    # exec_end extended by pad_post (clamped to neighbours / bounds).
-    segs = []  # (pause_start, exec_start, exec_end) inclusive exec
+    # together tile the rollout. The first `n_burst` steps each end in a 1x
+    # execution; any trailing steps (generated+ranked but never executed
+    # because the run stopped) become pause-only segments that split whatever
+    # rollout frames remain after the last burst.
+    segs = []  # (pause_start, exec_start, exec_end, has_exec)
     prev_end = -1
-    for i in range(n_use):
+    for i in range(n_burst):
         bs, be = bursts[i]
         es = max(prev_end + 1, bs - pad_pre)
         ee = be + pad_post
-        if i + 1 < n_use:
+        if i + 1 < n_burst:
             ee = min(ee, bursts[i + 1][0] - 1)
         ee = min(ee, nframes - 1)
         ps = prev_end + 1
-        segs.append((ps, es, ee))
+        segs.append((ps, es, ee, True))
         prev_end = ee
         print(f"  step {i}: pause f{ps}-{es-1} ({(es-ps)/fps_in:5.1f}s) | "
               f"exec f{es}-{ee} ({(ee-es+1)/fps_in:4.1f}s @1x)")
+    n_trail = n_steps - n_burst
+    if n_trail > 0:
+        # split the remaining rollout tail evenly across the un-executed steps
+        rem_lo, rem_hi = prev_end + 1, nframes - 1
+        span = max(0, rem_hi - rem_lo + 1)
+        for t in range(n_trail):
+            ps = rem_lo + t * span // n_trail
+            pe = rem_lo + (t + 1) * span // n_trail - 1  # inclusive pause end
+            pe = max(ps, min(pe, nframes - 1))
+            # exec_start > exec_end => empty exec region
+            segs.append((ps, pe + 1, pe, False))
+            print(f"  step {n_burst + t}: pause f{ps}-{pe} "
+                  f"({(pe - ps + 1)/fps_in:5.1f}s) | no execution (pause-only)")
 
     fps = args.fps
     writer = Writer(out_path, fps)
@@ -618,21 +668,21 @@ def main():
     K0 = len(glob.glob(os.path.join(steps[0], "*.mp4")))
     geo, row_h = row_geometry(max(1, K0))
 
-    for si, step_dir in enumerate(steps[:n_use]):
+    for si, step_dir in enumerate(steps):
         ranking, cand = load_step(step_dir)
         K = len(cand)
         geo, row_h = row_geometry(K)
         votes_final = ranking.get("votes", [0] * K)
         winner_idx = int(ranking.get("winner_idx", int(np.argmax(votes_final))))
         pairs = ranking.get("pairs", [])
-        ps, es, ee = segs[si]
+        ps, es, ee, has_exec = segs[si]
 
         # ---------- PAUSE region: left sped up, right = gen/rank/winner ----------
         pause_len = es - ps
         n_out = max(1, int(np.ceil(pause_len / max(1, args.pause_speedup))))
         states = build_pause_states(n_out, pairs, votes_final, winner_idx, K,
                                     gen_frac=args.gen_frac,
-                                    rank_frac=args.rank_frac)
+                                    rank_frac=args.rank_frac, executed=has_exec)
         # collect the kept (every-Nth) source frames for the left panel
         left_frames = []
         kept_target = set(ps + k * args.pause_speedup for k in range(n_out))
