@@ -80,6 +80,30 @@ RIGHT_X1 = W - PAD
 # vertical space reserved under each candidate video for its label + vote bar
 LABEL_H = 52
 
+# The exact prompt the VLM is shown for each task kind. The task is identified
+# by a substring of the run_dir name. Surfaced during the slow comparisons so a
+# viewer can see how the ranker is being asked to judge each pair.
+TASK_PROMPTS = {
+    "pnp_lego": ("Task: Pick and Place the red lego into the brown bowl. "
+                 "Which image shows more task progress (the first or the "
+                 "second)? Respond with -1 or 1."),
+    "stacking": ("Task: Stack the orange block onto the tan block. Which "
+                 "image shows more task progress (the first or the second)? "
+                 "Respond with -1 or 1."),
+    "push_bowl": ("Task: Push the bowl onto the white placemat. Which image "
+                  "shows more task progress (the first or the second)? "
+                  "Respond with -1 or 1."),
+}
+
+
+def detect_task_prompt(run_dir):
+    """Return the VLM prompt for the task named in run_dir, or None."""
+    low = run_dir.lower()
+    for key, prompt in TASK_PROMPTS.items():
+        if key in low:
+            return prompt
+    return None
+
 
 # ---------------------------------------------------------------------------
 # Fonts
@@ -400,8 +424,51 @@ def draw_left(img, left_frame, label, tl):
     tl.add((LEFT_X0 + 6, y0 + box_h + 4), label, 22, SUBTLE, bold=True)
 
 
+def wrap_text(text, max_chars):
+    """Greedy word-wrap to lines of at most ~max_chars characters."""
+    words = text.split()
+    lines, cur = [], ""
+    for w in words:
+        if cur and len(cur) + 1 + len(w) > max_chars:
+            lines.append(cur)
+            cur = w
+        else:
+            cur = f"{cur} {w}" if cur else w
+    if cur:
+        lines.append(cur)
+    return lines
+
+
+def draw_vlm_box(img, tl, vlm):
+    """Draw the VLM-prompt explainer in the empty lower band of the left panel.
+
+    `vlm` = {prompt, first, second, winner, answer}. Shows the exact prompt
+    text, which sample is the "first"/"second" image, and the VLM's response.
+    """
+    x0, x1 = LEFT_X0 + 10, LEFT_X1 - 10
+    y1 = HEADER_H + PAD + (H - (HEADER_H + PAD) - PAD - 30) - 6
+    y0 = y1 - 250
+    fill_rect(img, x0, y0, x1, y1, (12, 14, 19))
+    border_rect(img, x0, y0, x1, y1, ACCENT, 2)
+    tl.add((x0 + 14, y0 + 10), "VLM Critic Prompt:", 19, ACCENT, bold=True)
+    yy = y0 + 42
+    for line in wrap_text(vlm["prompt"], 56):
+        tl.add((x0 + 14, yy), line, 20, TEXT)
+        yy += 27
+    yy += 6
+    # tl.add((x0 + 14, yy),
+    #        f"First image = Sample {vlm['first']}      "
+    #        f"Second image = Sample {vlm['second']}", 20, HILITE, bold=True)
+    yy += 30
+    ans = vlm["answer"]
+    which = "first" if ans < 0 else "second"
+    tl.add((x0 + 14, yy),
+           f"Critic Answer: {ans:+d}",
+           20, WIN, bold=True)
+
+
 def compose(left_frame, left_label, cand_imgs, geo, phase, phase_color,
-            votes, active_pair, verdict, winner_idx, dim_losers):
+            votes, active_pair, verdict, winner_idx, dim_losers, vlm_info=None):
     """Render one output frame.
 
     votes        : running tally list[int] (len K) or None
@@ -423,6 +490,8 @@ def compose(left_frame, left_label, cand_imgs, geo, phase, phase_color,
     tl.add((RIGHT_X0 + 12, 50), phase, 20, phase_color)
 
     draw_left(img, left_frame, left_label, tl)
+    if vlm_info is not None:
+        draw_vlm_box(img, tl, vlm_info)
 
     K = len(cand_imgs)
     max_votes = max(votes) if (votes and max(votes) > 0) else 1
@@ -442,6 +511,13 @@ def compose(left_frame, left_label, cand_imgs, geo, phase, phase_color,
         elif is_active:
             bcol, bt = HILITE, 3
         border_rect(img, tx, ty, tx + tw, ty + th, bcol, bt)
+
+        # FIRST/SECOND badge on the two videos being compared (slow comparison)
+        if vlm_info is not None and k in (vlm_info["first"], vlm_info["second"]):
+            badge = "FIRST" if k == vlm_info["first"] else "SECOND"
+            bw = 90 if badge == "SECOND" else 62
+            fill_rect(img, tx, ty, tx + bw, ty + 26, ACCENT)
+            tl.add((tx + 6, ty + 4), badge, 18, (12, 14, 19), bold=True)
 
         # ---- label + vote bar underneath the video ----
         lab_col = WIN if is_winner else (HILITE if is_active else TEXT)
@@ -502,7 +578,8 @@ class Writer:
 # Right-panel state plan for one (sped-up) pause region
 # ---------------------------------------------------------------------------
 def build_pause_states(pairs, votes_final, winner_idx, K, n_gen, n_win,
-                       pair_frames, n_out=None, executed=True):
+                       pair_frames, n_out=None, prompt_text=None, slow_count=0,
+                       executed=True):
     """Return the list of right-panel state dicts for one pause region.
 
     The pause is three sub-phases concatenated: generation (`n_gen` frames,
@@ -530,12 +607,16 @@ def build_pause_states(pairs, votes_final, winner_idx, K, n_gen, n_win,
                 tally[int(pairs[q]["winner"])] += 1
             i, j, w = int(pr["i"]), int(pr["j"]), int(pr["winner"])
             loser = j if w == i else i
+            vlm = None
+            if prompt_text is not None and pi < slow_count:
+                vlm = dict(prompt=prompt_text, first=i, second=j, winner=w,
+                           answer=(-1 if w == i else 1))
             st = dict(
                 phase=f"VLM pairwise ranking  ({pi + 1}/{P})   "
                       f"Sample {i} vs Sample {j}  ->  Sample {w} wins",
                 phase_color=HILITE, votes=tally, active_pair=(i, j),
                 verdict={w: "win", loser: "lose"}, winner_idx=None,
-                dim_losers=False)
+                dim_losers=False, vlm=vlm)
             for _ in range(max(0, int(pair_frames[pi]))):
                 states.append(st)
 
@@ -653,6 +734,8 @@ def main():
     print(f"[info] rollout : {rollout_path}")
     print(f"[info] {n_all} decision steps"
           + (f" (rendering first {n_steps})" if n_steps != n_all else ""))
+    prompt_text = detect_task_prompt(run_dir)
+    print(f"[info] VLM prompt: {prompt_text!r}")
 
     # ---- precise execution windows from the pixels ----
     # Detect over the FULL rollout (all steps) so burst<->step pairing is
@@ -754,9 +837,11 @@ def main():
         narration = n_gen + sum(pair_frames) + n_win
         n_out = max(narration,
                     int(np.ceil(pause_len / max(1, args.pause_speedup))))
+        slow_count = args.slow_pairs if si == 0 else 0
         states = build_pause_states(pairs, votes_final, winner_idx, K, n_gen,
                                     n_win, pair_frames, n_out=n_out,
-                                    executed=has_exec)
+                                    prompt_text=prompt_text,
+                                    slow_count=slow_count, executed=has_exec)
         n_out = len(states)
         # sample exactly n_out source frames across the pause (monotonic,
         # forward-only); reuse the last read when n_out exceeds pause_len.
@@ -790,7 +875,8 @@ def main():
                 lf, f"Generating + ranking — {eff_speed}x speed up",
                 cand_frame(cand, K, t, fps, speed=args.cand_speed), geo,
                 st["phase"], st["phase_color"], st["votes"], st["active_pair"],
-                st["verdict"], st["winner_idx"], st["dim_losers"])
+                st["verdict"], st["winner_idx"], st["dim_losers"],
+                vlm_info=st.get("vlm"))
             writer.write(frame)
             total_out += 1
 
