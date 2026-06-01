@@ -370,9 +370,8 @@ def draw_left(img, left_frame, label, tl):
     tl.add((LEFT_X0 + 6, y0 + box_h + 4), label, 22, SUBTLE, bold=True)
 
 
-def compose(left_frame, left_label, cand_imgs, geo, row_h, n_steps, step_idx,
-            task, phase, phase_color, votes, active_pair, verdict, winner_idx,
-            dim_losers, speed_tag):
+def compose(left_frame, left_label, cand_imgs, geo, row_h, phase, phase_color,
+            votes, active_pair, verdict, winner_idx, dim_losers):
     """Render one output frame.
 
     votes        : running tally list[int] (len K) or None
@@ -380,17 +379,18 @@ def compose(left_frame, left_label, cand_imgs, geo, row_h, n_steps, step_idx,
     verdict      : {idx: 'win'|'lose'} for the active pair, or None
     winner_idx   : highlight this row green (final), or None
     dim_losers   : dim all non-winner rows
-    speed_tag    : small badge text, e.g. "10x" or "1x  (executing)"
     """
     img = base_canvas()
     tl = TextLayer(img)
 
-    # header
-    tl.add((PAD + 4, 12), task, 30, TEXT, bold=True)
-    tl.add((PAD + 4, 48), phase, 21, phase_color)
-    tl.add((W - PAD - 4, 12), f"Step {step_idx + 1}/{n_steps}", 27, ACCENT,
-           bold=True, anchor="ra")
-    tl.add((W - PAD - 4, 48), speed_tag, 20, SUBTLE, anchor="ra")
+    # header: a title box over each panel + the phase narration under the
+    # samples title.
+    fill_rect(img, LEFT_X0, 8, LEFT_X1, HEADER_H - 8, BAR_BG)
+    fill_rect(img, RIGHT_X0, 8, RIGHT_X1, HEADER_H - 8, BAR_BG)
+    tl.add(((LEFT_X0 + LEFT_X1) // 2, HEADER_H // 2), "Real Robot", 30, TEXT,
+           bold=True, anchor="mm")
+    tl.add((RIGHT_X0 + 12, 12), "Generated Samples", 28, TEXT, bold=True)
+    tl.add((RIGHT_X0 + 12, 50), phase, 20, phase_color)
 
     draw_left(img, left_frame, left_label, tl)
 
@@ -608,10 +608,6 @@ def main():
     print(f"[info] {n_all} decision steps"
           + (f" (rendering first {n_steps})" if n_steps != n_all else ""))
 
-    with open(os.path.join(steps[0], "ranking.json")) as f:
-        r0 = json.load(f)
-    task = "Task: " + str(r0.get("task_name") or r0.get("task") or "rollout")
-
     # ---- precise execution windows from the pixels ----
     # Detect over the FULL rollout (all steps) so burst<->step pairing is
     # correct even when --max_steps truncates rendering.
@@ -701,11 +697,10 @@ def main():
             st = states[t]
             lf = left_frames[min(t, len(left_frames) - 1)]
             frame = compose(
-                lf, "Real robot  (paused — generating + ranking)",
-                cand_frame(cand, K, t, fps), geo, row_h, n_steps, si, task,
+                lf, f"Generating + ranking — {args.pause_speedup}x speed up",
+                cand_frame(cand, K, t, fps), geo, row_h,
                 st["phase"], st["phase_color"], st["votes"], st["active_pair"],
-                st["verdict"], st["winner_idx"], st["dim_losers"],
-                speed_tag=f"{args.pause_speedup}x  fast-forward")
+                st["verdict"], st["winner_idx"], st["dim_losers"])
             writer.write(frame)
             total_out += 1
 
@@ -718,11 +713,10 @@ def main():
             cur_idx += 1
             lf = cv2.cvtColor(cv2.resize(f, (640, 360)), cv2.COLOR_BGR2RGB)
             frame = compose(
-                lf, f"Real robot  —  executing Sample {winner_idx}",
-                win_cand_last, geo, row_h, n_steps, si, task,
+                lf, f"Executing Sample {winner_idx}",
+                win_cand_last, geo, row_h,
                 f"Executing chosen action (Sample {winner_idx}) on the real robot",
-                WIN, list(votes_final), None, None, winner_idx, True,
-                speed_tag="1x  (real time)")
+                WIN, list(votes_final), None, None, winner_idx, True)
             writer.write(frame)
             total_out += 1
 

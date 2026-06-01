@@ -60,22 +60,22 @@ ema:
   max_value: 0.9999
 
 dataloader:
-  batch_size: 64
+  batch_size: 256
   num_workers: 8
   shuffle: True
   pin_memory: True
-  persistent_workers: False
+  persistent_workers: True
 
 val_dataloader:
-  batch_size: 64
+  batch_size: 256
   num_workers: 8
   shuffle: False
   pin_memory: True
-  persistent_workers: False
+  persistent_workers: True
 
 optimizer:
   _target_: torch.optim.AdamW
-  lr: 1.0e-4
+  lr: 4.0e-4
   betas: [0.95, 0.999]
   eps: 1.0e-8
   weight_decay: 1.0e-6
@@ -87,7 +87,7 @@ training:
   resume: True
   # optimization
   lr_scheduler: cosine
-  lr_warmup_steps: 500
+  lr_warmup_steps: 1000
   num_epochs: 3050
   gradient_accumulate_every: 1
   # EMA destroys performance when used with BatchNorm

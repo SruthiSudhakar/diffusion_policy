@@ -63,6 +63,10 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
     def run(self):
         cfg = copy.deepcopy(self.cfg)
 
+        # enable TF32 matmul/cudnn (free speedup on Ampere, fp32-level accuracy)
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
         # ---- accelerate setup ----------------------------------------------
         # mixed_precision='no' preserves the repo's existing fp32 training.
         accelerator = Accelerator(
