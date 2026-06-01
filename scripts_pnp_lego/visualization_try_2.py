@@ -58,6 +58,10 @@ W, H = 1920, 1080
 HEADER_H = 78
 PAD = 14
 
+# Frame rate the generated candidate clips were written at (HunyuanVideo
+# server writes 24fps mp4s).
+CAND_SRC_FPS = 24.0
+
 BG = (18, 20, 26)
 PANEL_BG = (30, 33, 42)
 TEXT = (235, 238, 244)
@@ -471,20 +475,28 @@ class Writer:
 # Right-panel state plan for one (sped-up) pause region
 # ---------------------------------------------------------------------------
 def build_pause_states(n_out, pairs, votes_final, winner_idx, K,
-                       gen_frac=0.22, rank_frac=0.62, executed=True):
+                       gen_frac=0.22, rank_frac=0.62, gen_frames=None,
+                       executed=True):
     """Return a list of `n_out` right-panel state dicts for one pause region.
 
     The pause region is split into three sub-phases whose lengths sum to
     n_out: generation (candidates play, no votes) -> pairwise ranking (pairs
     revealed one-by-one, running tally grows) -> winner reveal. Each output
     frame gets a dict telling `compose` what to draw.
+
+    `gen_frames`, if given, forces the generation sub-phase to be at least that
+    many output frames (used to hold ranking off until the candidate clips have
+    finished their single play-through and are frozen on their last frame).
     """
     n_out = max(1, n_out)
     n_gen = max(1, int(round(n_out * gen_frac)))
-    n_rank = max(1, int(round(n_out * rank_frac)))
+    if gen_frames is not None:
+        n_gen = max(n_gen, int(gen_frames))
     n_gen = min(n_gen, n_out - 1)
-    n_rank = min(n_rank, n_out - n_gen)
-    n_win = max(0, n_out - n_gen - n_rank)
+    rem = n_out - n_gen
+    # winner reveal keeps >=1 frame when there's room; ranking takes the rest
+    n_rank = max(1, min(int(round(n_out * rank_frac)), rem - 1 if rem > 1 else rem))
+    n_win = max(0, rem - n_rank)
 
     states = []
 
@@ -546,7 +558,7 @@ def build_pause_states(n_out, pairs, votes_final, winner_idx, K,
 # ---------------------------------------------------------------------------
 # Main assembly
 # ---------------------------------------------------------------------------
-def cand_frame(cand, K, t_out, out_fps, speed=0.5, src_fps=24.0):
+def cand_frame(cand, K, t_out, out_fps, speed=0.5, src_fps=CAND_SRC_FPS):
     """Candidate frame for each sample at pause-region output index t_out.
 
     Plays each generated clip through exactly once at `speed` (0.5 = half
@@ -577,6 +589,10 @@ def main():
                     help="playback speed of the generated candidate clips "
                          "(0.5 = half speed). Each clip plays through once then "
                          "freezes on its last frame while ranking proceeds.")
+    ap.add_argument("--gen_hold", type=float, default=0.4,
+                    help="seconds the candidate clips stay frozen on their last "
+                         "frame after the play-through before pairwise ranking "
+                         "begins.")
     ap.add_argument("--exec_pad_pre", type=float, default=0.25,
                     help="seconds of real-time lead-in before each detected "
                          "execution burst")
@@ -686,9 +702,17 @@ def main():
         # ---------- PAUSE region: left sped up, right = gen/rank/winner ----------
         pause_len = es - ps
         n_out = max(1, int(np.ceil(pause_len / max(1, args.pause_speedup))))
+        # generation sub-phase must last at least one full 0.5x play-through of
+        # the longest candidate clip (+ a short frozen hold) so the pairwise
+        # ranking only starts once every clip is paused on its last frame.
+        max_clip = max((len(c) for c in cand), default=1)
+        play_once = int(np.ceil((max_clip - 1) * fps
+                                / (CAND_SRC_FPS * max(1e-6, args.cand_speed))))
+        gen_frames = play_once + int(round(args.gen_hold * fps))
         states = build_pause_states(n_out, pairs, votes_final, winner_idx, K,
                                     gen_frac=args.gen_frac,
-                                    rank_frac=args.rank_frac, executed=has_exec)
+                                    rank_frac=args.rank_frac,
+                                    gen_frames=gen_frames, executed=has_exec)
         # collect the kept (every-Nth) source frames for the left panel
         left_frames = []
         kept_target = set(ps + k * args.pause_speedup for k in range(n_out))
