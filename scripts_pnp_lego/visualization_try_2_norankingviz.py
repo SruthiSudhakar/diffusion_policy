@@ -1,33 +1,30 @@
 #!/usr/bin/env python
-"""Build an explainer video for a ``--videogen`` VLM rollout (take 2).
+"""Explainer video for a ``--videogen`` VLM rollout — NO pairwise-ranking viz.
 
-This renders ONE continuous timeline. The left panel is the *real* robot
-rollout (rollout.mp4) played straight through; the right panel shows, for each
-decision step, the K candidate "future" videos the generator produced, the VLM
-pairwise rankings revealed one-by-one with a running vote tally, and finally the
-chosen sample being executed.
+Variant of ``visualization_try_2.py``. Same single continuous timeline and
+precise pixel-based execution detection, but the right panel does NOT reveal the
+VLM's pairwise comparisons one-by-one. Instead, per step:
 
-The whole thing is driven off a single forward pass through rollout.mp4 with a
-two-speed playback:
+  1. The K candidate "future" videos all play together (once, at 0.5x), then
+     freeze.
+  2. The global VLM score appears below each candidate at once (no one-by-one
+     ranking) and the winner is highlighted.
+  3. The chosen action plays on the real robot.
 
-  * PAUSED stretches (robot holding still while video-gen + VLM ranking happen)
-    are played back ``--pause_speedup`` times faster (default 10x). While they
-    play, the right panel animates that step's generation -> pairwise ranking ->
-    winner reveal, time-stretched to fill exactly the sped-up pause.
-  * EXECUTION bursts (robot actually moving the chosen action) are played at
-    1x (real time), with the winning sample highlighted on the right.
+Focus alternates between the two panels to direct the eye:
+  * While the candidates play + are scored (the paused/generation stretch), the
+    Generated Samples are bright and the Real Robot panel is dimmed.
+  * While the robot executes, the Real Robot panel is bright and the Generated
+    Samples dim.
 
-The execution bursts are detected *precisely* and directly from the pixels, with
-no reliance on in-code timestamps or fragile mtime->frame alignment. The trick
-(see ``robust_motion_signal``) is to measure, per frame, the number of pixels
-whose frame-to-frame change deviates from the *global* illumination shift. A
-moving arm is a spatially-localised change; camera auto-exposure is a global
-shift that this subtraction cancels. The result is one clean burst per step.
+EXECUTION bursts are played at 1x; PAUSED stretches are sped up. Bursts are
+detected directly from the pixels (see ``robust_motion_signal``): per frame, the
+count of pixels whose change deviates from the global illumination shift — a
+moving arm survives, camera auto-exposure cancels — giving one clean burst/step.
 
 Usage:
-  python scripts_pnp_lego/visualization_try_2.py \
-      --run_dir /proj/vondrick3/sruthi/Appaji/diffusion_policy/data/jgd/realworld_data/jgd/2026.05.19/23.23.33_train_diffusion_unet_hybrid_stacking_image_10hz_wstate/checkpoints/epoch=0500-train_loss=0.0148/50jgd_4s_2026-05-21_22-52-07_VLM 
-      
+  python scripts_pnp_lego/visualization_try_2_norankingviz.py \
+      --run_dir <run_dir> --score_sec 2.5
 """
 import argparse
 import glob
@@ -80,30 +77,6 @@ RIGHT_X0 = 762
 RIGHT_X1 = W - PAD
 # vertical space reserved under each candidate video for its label + vote bar
 LABEL_H = 52
-
-# The exact prompt the VLM is shown for each task kind. The task is identified
-# by a substring of the run_dir name. Surfaced during the slow comparisons so a
-# viewer can see how the ranker is being asked to judge each pair.
-TASK_PROMPTS = {
-    "pnp_lego": ("Task: Pick and Place the red lego into the brown bowl. "
-                 "Which image shows more task progress (the first or the "
-                 "second)? Respond with -1 or 1."),
-    "stacking": ("Task: Stack the orange block onto the tan block. Which "
-                 "image shows more task progress (the first or the second)? "
-                 "Respond with -1 or 1."),
-    "push_bowl": ("Task: Push the bowl onto the white placemat. Which image "
-                  "shows more task progress (the first or the second)? "
-                  "Respond with -1 or 1."),
-}
-
-
-def detect_task_prompt(run_dir):
-    """Return the VLM prompt for the task named in run_dir, or None."""
-    low = run_dir.lower()
-    for key, prompt in TASK_PROMPTS.items():
-        if key in low:
-            return prompt
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -425,123 +398,66 @@ def draw_left(img, left_frame, label, tl):
     tl.add((LEFT_X0 + 6, y0 + box_h + 4), label, 22, SUBTLE, bold=True)
 
 
-def wrap_text(text, max_chars):
-    """Greedy word-wrap to lines of at most ~max_chars characters."""
-    words = text.split()
-    lines, cur = [], ""
-    for w in words:
-        if cur and len(cur) + 1 + len(w) > max_chars:
-            lines.append(cur)
-            cur = w
-        else:
-            cur = f"{cur} {w}" if cur else w
-    if cur:
-        lines.append(cur)
-    return lines
-
-
-def draw_vlm_box(img, tl, vlm):
-    """Draw the VLM-prompt explainer in the empty lower band of the left panel.
-
-    `vlm` = {prompt, first, second, winner, answer}. Shows the exact prompt
-    text, which sample is the "first"/"second" image, and the VLM's response.
-    """
-    x0, x1 = LEFT_X0 + 10, LEFT_X1 - 10
-    y1 = HEADER_H + PAD + (H - (HEADER_H + PAD) - PAD - 30) - 6
-    y0 = y1 - 250
-    fill_rect(img, x0, y0, x1, y1, (12, 14, 19))
-    border_rect(img, x0, y0, x1, y1, ACCENT, 2)
-    tl.add((x0 + 14, y0 + 10), "VLM Critic Prompt:", 19, ACCENT, bold=True)
-    yy = y0 + 42
-    for line in wrap_text(vlm["prompt"], 56):
-        tl.add((x0 + 14, yy), line, 20, TEXT)
-        yy += 27
-    yy += 6
-    # tl.add((x0 + 14, yy),
-    #        f"First image = Sample {vlm['first']}      "
-    #        f"Second image = Sample {vlm['second']}", 20, HILITE, bold=True)
-    yy += 30
-    ans = vlm["answer"]
-    which = "first" if ans < 0 else "second"
-    tl.add((x0 + 14, yy),
-           f"Critic Answer: {ans:+d}",
-           20, WIN, bold=True)
-
-
 def compose(left_frame, left_label, cand_imgs, geo, phase, phase_color,
-            votes, active_pair, verdict, winner_idx, dim_losers, vlm_info=None,
+            votes, winner_idx, dim_left=False, dim_samples=False,
             winner_blink_on=True):
     """Render one output frame.
 
-    votes           : running tally list[int] (len K) or None
-    active_pair     : (i, j) currently being compared, or None
-    verdict         : {idx: 'win'|'lose'} for the active pair, or None
-    winner_idx      : highlight this cell green (final), or None
-    dim_losers      : dim all non-winner cells
-    winner_blink_on : when False, draw the winner box in dim green (drives the
-                      acceptance blink)
+    votes           : global VLM score list[int] (len K) shown below each
+                      candidate, or None (during generation, before scoring)
+    winner_idx      : highlight this cell green, or None
+    dim_left        : darken the Real Robot panel (focus is on the samples)
+    dim_samples     : darken all candidate videos (focus is on the robot)
+    winner_blink_on : when False, draw the winner box in dim green instead of
+                      bright green (drives the acceptance blink)
     """
     img = base_canvas()
     tl = TextLayer(img)
 
-    # header: a title box over each panel + the phase narration under the
-    # samples title.
+    # header: a title box over each panel + the phase narration. The title of
+    # the dimmed side is muted so the focus shift reads clearly.
     fill_rect(img, LEFT_X0, 8, LEFT_X1, HEADER_H - 8, BAR_BG)
     fill_rect(img, RIGHT_X0, 8, RIGHT_X1, HEADER_H - 8, BAR_BG)
-    tl.add(((LEFT_X0 + LEFT_X1) // 2, HEADER_H // 2), "Real Robot", 30, TEXT,
-           bold=True, anchor="mm")
-    tl.add((RIGHT_X0 + 12, 12), "Generated Samples", 28, TEXT, bold=True)
+    tl.add(((LEFT_X0 + LEFT_X1) // 2, HEADER_H // 2), "Real Robot", 30,
+           SUBTLE if dim_left else TEXT, bold=True, anchor="mm")
+    tl.add((RIGHT_X0 + 12, 12), "Generated Samples", 28,
+           SUBTLE if dim_samples else TEXT, bold=True)
     tl.add((RIGHT_X0 + 12, 50), phase, 20, phase_color)
 
-    draw_left(img, left_frame, left_label, tl)
-    if vlm_info is not None:
-        draw_vlm_box(img, tl, vlm_info)
+    lf = ((left_frame.astype(np.float32) * 0.35).astype(np.uint8)
+          if dim_left else left_frame)
+    draw_left(img, lf, left_label, tl)
 
     K = len(cand_imgs)
     max_votes = max(votes) if (votes and max(votes) > 0) else 1
     for k in range(K):
         tx, ty, tw, th, cx0, cw = geo[k]
-        is_active = active_pair is not None and k in active_pair
         is_winner = winner_idx is not None and k == winner_idx
 
         thumb = cv2.resize(cand_imgs[k], (tw, th), interpolation=cv2.INTER_AREA)
-        if dim_losers and not is_winner:
-            thumb = (thumb.astype(np.float32) * 0.4).astype(np.uint8)
+        if dim_samples:
+            thumb = (thumb.astype(np.float32) * 0.35).astype(np.uint8)
         paste(img, thumb, tx, ty)
 
-        win_col = WIN if winner_blink_on else WIN_DIM
         bcol, bt = (70, 76, 90), 2
         if is_winner:
-            bcol, bt = win_col, 5
-        elif is_active:
-            bcol, bt = HILITE, 3
+            bcol, bt = (WIN if winner_blink_on else WIN_DIM), 5
         border_rect(img, tx, ty, tx + tw, ty + th, bcol, bt)
 
-        # FIRST/SECOND badge on the two videos being compared (slow comparison)
-        if vlm_info is not None and k in (vlm_info["first"], vlm_info["second"]):
-            badge = "FIRST" if k == vlm_info["first"] else "SECOND"
-            bw = 90 if badge == "SECOND" else 62
-            fill_rect(img, tx, ty, tx + bw, ty + 26, ACCENT)
-            tl.add((tx + 6, ty + 4), badge, 18, (12, 14, 19), bold=True)
-
-        # ---- label + vote bar underneath the video ----
-        lab_col = win_col if is_winner else (HILITE if is_active else TEXT)
+        # ---- label + global score bar underneath the video ----
+        lab_col = WIN if is_winner else TEXT
         uy = ty + th + 5
         tl.add((tx, uy), f"Sample {k}", 21, lab_col, bold=True)
-
-        if is_winner and dim_losers:  # winner-reveal / execution: accepted
-            tl.add((tx + tw, uy), "ACCEPTED", 20, win_col, bold=True,
+        if is_winner and votes is not None:
+            tag_col = WIN if winner_blink_on else WIN_DIM
+            tl.add((tx + tw, uy), "SELECTED", 20, tag_col, bold=True,
                    anchor="ra")
-        elif verdict is not None and k in verdict:
-            v = verdict[k]
-            tag = "WIN" if v == "win" else "lose"
-            tcol = WIN if v == "win" else LOSE
-            tl.add((tx + tw, uy), tag, 20, tcol, bold=True, anchor="ra")
 
         if votes is not None:
-            bx0, bx1 = tx, tx + tw - 36
             by0 = uy + 27
             by1 = by0 + 16
+            tl.add((tx, by0 - 3), "Ranking:", 18, SUBTLE, bold=True)
+            bx0, bx1 = tx + 92, tx + tw - 36
             fill_rect(img, bx0, by0, bx1, by1, BAR_BG)
             frac = votes[k] / max_votes
             fcol = WIN if is_winner else ACCENT
@@ -585,64 +501,46 @@ class Writer:
 # ---------------------------------------------------------------------------
 # Right-panel state plan for one (sped-up) pause region
 # ---------------------------------------------------------------------------
-def build_pause_states(pairs, votes_final, winner_idx, K, n_gen, n_win,
-                       pair_frames, n_out=None, prompt_text=None, slow_count=0,
-                       executed=True):
-    """Return the list of right-panel state dicts for one pause region.
+def build_pause_states(votes_final, winner_idx, K, n_gen, n_score, n_out=None,
+                       n_denoise=0, executed=True):
+    """Return the right-panel state dicts for one pause region (no ranking viz).
 
-    The pause is three sub-phases concatenated: generation (`n_gen` frames,
-    candidates playing, no votes) -> pairwise ranking (each pair pi shown for
-    `pair_frames[pi]` output frames with a growing running tally) -> winner
-    reveal (`n_win` frames). The natural length is the sum of those; if `n_out`
-    is given and larger, the winner reveal is held to pad up to `n_out`.
+    Two sub-phases: generation (`n_gen` frames — candidates playing, no score)
+    then global score (`n_score` frames — the full VLM tally shown below every
+    candidate at once with the winner highlighted; no one-by-one pairwise
+    reveal). The first `n_denoise` of the generation frames are the diffusion
+    denoise dissolve (noise -> first frame) and get their own label. Throughout
+    the pause the Real Robot panel is dimmed and the samples are bright. If
+    `n_out` is larger than the natural length, the score frame is held to pad up.
     """
     states = []
 
-    # phase 1: generation
-    for _ in range(n_gen):
+    # phase 1: generation — diffusion denoise dissolve, then candidates playing
+    for g in range(n_gen):
+        if g < n_denoise:
+            phase = (f"A video diffusion model denoises random noise into "
+                     f"{K} candidate futures")
+        else:
+            phase = f"Generating {K} candidate futures from the policy"
         states.append(dict(
-            phase=f"Generating {K} candidate futures from the policy",
-            phase_color=ACCENT, votes=None, active_pair=None, verdict=None,
-            winner_idx=None, dim_losers=False))
+            phase=phase,
+            phase_color=ACCENT, votes=None, winner_idx=None,
+            dim_left=True, dim_samples=False))
 
-    # phase 2: pairwise ranking with a growing running tally; each pair lingers
-    # for its own pair_frames[pi] output frames.
-    P = len(pairs)
-    if P > 0:
-        for pi, pr in enumerate(pairs):
-            tally = [0] * K
-            for q in range(pi + 1):
-                tally[int(pairs[q]["winner"])] += 1
-            i, j, w = int(pr["i"]), int(pr["j"]), int(pr["winner"])
-            loser = j if w == i else i
-            vlm = None
-            if prompt_text is not None and pi < slow_count:
-                vlm = dict(prompt=prompt_text, first=i, second=j, winner=w,
-                           answer=(-1 if w == i else 1))
-            st = dict(
-                phase=f"VLM pairwise ranking  ({pi + 1}/{P})   "
-                      f"Sample {i} vs Sample {j}  ->  Sample {w} wins",
-                phase_color=HILITE, votes=tally, active_pair=(i, j),
-                verdict={w: "win", loser: "lose"}, winner_idx=None,
-                dim_losers=False, vlm=vlm)
-            for _ in range(max(0, int(pair_frames[pi]))):
-                states.append(st)
-
-    # phase 3: winner reveal
+    # phase 2: global score appears below every candidate at once
     tail = ("executing on robot" if executed
             else "run ended before execution")
-    for _ in range(n_win):
+    for _ in range(n_score):
         states.append(dict(
-            phase=f"VLM chose Sample {winner_idx}  (votes: "
-                  f"{votes_final[winner_idx]})  ->  {tail}",
-            phase_color=WIN, votes=list(votes_final), active_pair=None,
-            verdict=None, winner_idx=winner_idx, dim_losers=True))
+            phase=f"VLM scores all candidates  ->  Sample {winner_idx} wins "
+                  f"(score {votes_final[winner_idx]})  ->  {tail}",
+            phase_color=WIN, votes=list(votes_final), winner_idx=winner_idx,
+            dim_left=True, dim_samples=False))
 
     if not states:
         states.append(dict(phase="", phase_color=ACCENT, votes=None,
-                           active_pair=None, verdict=None, winner_idx=None,
-                           dim_losers=False))
-    # hold the last (winner) frame to pad up to n_out when requested
+                           winner_idx=None, dim_left=True, dim_samples=False))
+    # hold the last (score) frame to pad up to n_out when requested
     target = len(states) if n_out is None else max(n_out, len(states))
     while len(states) < target:
         states.append(states[-1])
@@ -668,6 +566,26 @@ def cand_frame(cand, K, t_out, out_fps, speed=0.5, src_fps=CAND_SRC_FPS):
     return out
 
 
+def denoise_cand_imgs(cand, noise_imgs, K, p):
+    """Per-candidate frame mid diffusion-denoise dissolve, at progress p in
+    [0, 1] (0 = pure noise, 1 = the clip's clean first frame).
+
+    A smooth continuous crossfade from each cell's fixed colored-static image
+    (`noise_imgs[k]`) to its first generated frame (`cand[k][0]`). smoothstep
+    easing makes the detail resolve in pleasingly rather than linearly. This
+    instantly signals the clips are produced by a video diffusion model.
+    """
+    s = p * p * (3.0 - 2.0 * p)        # smoothstep
+    sigma = 1.0 - s                    # noise weight
+    out = []
+    for k in range(K):
+        target = cand[k][0].astype(np.float32)
+        noise = noise_imgs[k].astype(np.float32)
+        mix = (1.0 - sigma) * target + sigma * noise
+        out.append(np.clip(mix, 0, 255).astype(np.uint8))
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser(
         description=__doc__,
@@ -683,36 +601,33 @@ def main():
                     help="playback speed of the generated candidate clips "
                          "(0.5 = half speed). Each clip plays through once then "
                          "freezes on its last frame while ranking proceeds.")
+    ap.add_argument("--denoise_sec", type=float, default=1.2,
+                    help="seconds of the diffusion denoise dissolve (random "
+                         "noise -> each clip's first frame) shown before the "
+                         "candidates play. 0 disables it.")
+    ap.add_argument("--denoise_seed", type=int, default=0,
+                    help="RNG seed for the per-candidate denoise static "
+                         "(reproducible noise).")
     ap.add_argument("--gen_hold", type=float, default=0.4,
                     help="seconds the candidate clips stay frozen on their last "
-                         "frame after the play-through before pairwise ranking "
-                         "begins.")
-    ap.add_argument("--slow_pairs", type=int, default=2,
-                    help="number of leading comparisons on the FIRST step that "
-                         "get the slow --slow_comparisons duration.")
-    ap.add_argument("--slow_comparisons", type=float, default=5.0,
-                    help="seconds each of the first --slow_pairs comparisons "
-                         "lingers, ON THE FIRST STEP ONLY (default 5s).")
-    ap.add_argument("--fast_comparisons", type=float, default=0.35,
-                    help="seconds each fast comparison lasts: the remaining "
-                         "comparisons on step 1, and ALL comparisons on later "
-                         "steps.")
-    ap.add_argument("--winner_sec", type=float, default=1.2,
-                    help="seconds the winner reveal is shown before execution.")
+                         "frame after the play-through before the score appears.")
+    ap.add_argument("--score_sec", type=float, default=2.5,
+                    help="seconds the global VLM score is shown below the "
+                         "candidates before the robot executes.")
     ap.add_argument("--winner_blink_hz", type=float, default=3.0,
-                    help="blink rate (Hz) of the winner's green box during the "
-                         "winner reveal (acceptance). 0 disables blinking.")
-    ap.add_argument("--winner_blink_count", type=int, default=3,
+                    help="blink rate (Hz) of the winner's green box while it is "
+                         "being accepted (score phase). 0 disables blinking.")
+    ap.add_argument("--winner_blink_count", type=int, default=2,
                     help="number of times the winner box flashes when it first "
                          "appears, then it holds solid green. 0 = blink for the "
-                         "whole winner-reveal phase.")
+                         "whole score phase.")
     ap.add_argument("--grid_cols", type=int, default=3,
                     help="columns in the candidate-video grid, used when "
                          "--grid_rows does not apply (e.g. 10 samples -> 3 "
                          "cols). Fewer columns => bigger, wider videos.")
-    ap.add_argument("--grid_rows", default="2,1,2",
+    ap.add_argument("--grid_rows", default="2,2,1",
                     help="explicit per-row sample counts, comma-separated "
-                         "(default '2,1,2' for 5 samples -> big videos). Used "
+                         "(default '2,2,1' for 5 samples -> big videos). Used "
                          "only when it sums to the number of samples; otherwise "
                          "falls back to --grid_cols. Pass '' to always use cols.")
     ap.add_argument("--exec_pad_pre", type=float, default=0.25,
@@ -739,7 +654,8 @@ def main():
         # camera-aware default name so two-camera runs don't clobber each other
         roll_stem = os.path.splitext(os.path.basename(rollout_path))[0]
         suffix = roll_stem[len("rollout"):]  # "" or "_image2"
-        out_path = os.path.join(run_dir, f"visualization_try_2{suffix}.mp4")
+        out_path = os.path.join(
+            run_dir, f"visualization_try_2_norankingviz{suffix}.mp4")
 
     all_steps = discover_steps(run_dir)
     n_all = len(all_steps)
@@ -749,8 +665,6 @@ def main():
     print(f"[info] rollout : {rollout_path}")
     print(f"[info] {n_all} decision steps"
           + (f" (rendering first {n_steps})" if n_steps != n_all else ""))
-    prompt_text = detect_task_prompt(run_dir)
-    print(f"[info] VLM prompt: {prompt_text!r}")
 
     # ---- precise execution windows from the pixels ----
     # Detect over the FULL rollout (all steps) so burst<->step pairing is
@@ -824,40 +738,31 @@ def main():
         pairs = ranking.get("pairs", [])
         ps, es, ee, has_exec = segs[si]
 
-        # ---------- PAUSE region: left sped up, right = gen/rank/winner ----------
+        # ---------- PAUSE region: left dimmed/sped up, samples bright ----------
         pause_len = es - ps
         # generation sub-phase lasts one full 0.5x play-through of the longest
-        # candidate clip (+ a short frozen hold) so ranking only starts once
+        # candidate clip (+ a short frozen hold) so the score only appears once
         # every clip is paused on its last frame.
         max_clip = max((len(c) for c in cand), default=1)
         play_once = int(np.ceil((max_clip - 1) * fps
                                 / (CAND_SRC_FPS * max(1e-6, args.cand_speed))))
-        n_gen = play_once + int(round(args.gen_hold * fps))
-        # explicit per-comparison durations. On the FIRST step the first
-        # --slow_pairs comparisons each linger for --slow_comparisons seconds;
-        # every other comparison (and all comparisons on later steps) lasts
-        # --fast_comparisons seconds.
-        slow_f = max(1, int(round(args.slow_comparisons * fps)))
-        fast_f = max(1, int(round(args.fast_comparisons * fps)))
-        P = len(pairs)
-        if si == 0:
-            pair_frames = [slow_f if pi < args.slow_pairs else fast_f
-                           for pi in range(P)]
-        else:
-            pair_frames = [fast_f] * P
-        n_win = max(1, int(round(args.winner_sec * fps)))
+        # generation = diffusion denoise dissolve -> clip play-through -> hold
+        n_denoise = max(0, int(round(args.denoise_sec * fps)))
+        n_gen = n_denoise + play_once + int(round(args.gen_hold * fps))
+        n_score = max(1, int(round(args.score_sec * fps)))
         # narration length drives the pause; if the real pause is longer than
         # 10x of it, we'd be too fast, so take whichever is longer and sample
         # the (static) robot frames to fit.
-        narration = n_gen + sum(pair_frames) + n_win
+        narration = n_gen + n_score
         n_out = max(narration,
                     int(np.ceil(pause_len / max(1, args.pause_speedup))))
-        slow_count = args.slow_pairs if si == 0 else 0
-        states = build_pause_states(pairs, votes_final, winner_idx, K, n_gen,
-                                    n_win, pair_frames, n_out=n_out,
-                                    prompt_text=prompt_text,
-                                    slow_count=slow_count, executed=has_exec)
+        states = build_pause_states(votes_final, winner_idx, K, n_gen, n_score,
+                                    n_out=n_out, n_denoise=n_denoise,
+                                    executed=has_exec)
         n_out = len(states)
+        # fixed per-candidate colored static for the denoise dissolve
+        noise_imgs = [np.random.default_rng(args.denoise_seed + k).integers(
+            0, 256, cand[k][0].shape, dtype=np.uint8) for k in range(K)]
         # sample exactly n_out source frames across the pause (monotonic,
         # forward-only); reuse the last read when n_out exceeds pause_len.
         left_frames = []
@@ -899,16 +804,24 @@ def main():
                 cyc = (t - first_win_t) // blink_period
                 if blink_halves == 0 or cyc < blink_halves:
                     blink_on = cyc % 2 == 0  # on, off, on, ... then solid
+            # diffusion denoise dissolve for the first n_denoise frames, then
+            # the clips play (cand_frame offset so play-once starts after it)
+            if t < n_denoise:
+                p = (t + 1) / n_denoise
+                cand_imgs = denoise_cand_imgs(cand, noise_imgs, K, p)
+            else:
+                cand_imgs = cand_frame(cand, K, t - n_denoise, fps,
+                                       speed=args.cand_speed)
             frame = compose(
-                lf, f"Generating + ranking — {eff_speed}x speed up",
-                cand_frame(cand, K, t, fps, speed=args.cand_speed), geo,
-                st["phase"], st["phase_color"], st["votes"], st["active_pair"],
-                st["verdict"], st["winner_idx"], st["dim_losers"],
-                vlm_info=st.get("vlm"), winner_blink_on=blink_on)
+                lf, f"Generating + scoring — {eff_speed}x speed up",
+                cand_imgs, geo,
+                st["phase"], st["phase_color"], st["votes"], st["winner_idx"],
+                dim_left=st["dim_left"], dim_samples=st["dim_samples"],
+                winner_blink_on=blink_on)
             writer.write(frame)
             total_out += 1
 
-        # ---------- EXEC region: left at 1x, right = winner executing ----------
+        # ---------- EXEC region: left bright at 1x, samples dimmed ----------
         win_cand_last = [c[-1] for c in cand]
         while cur_idx <= ee:
             ok, f = cap.read()
@@ -920,7 +833,8 @@ def main():
                 lf, f"Executing Sample {winner_idx}",
                 win_cand_last, geo,
                 f"Executing chosen action (Sample {winner_idx}) on the real robot",
-                WIN, list(votes_final), None, None, winner_idx, True)
+                WIN, list(votes_final), winner_idx,
+                dim_left=False, dim_samples=True)
             writer.write(frame)
             total_out += 1
 
