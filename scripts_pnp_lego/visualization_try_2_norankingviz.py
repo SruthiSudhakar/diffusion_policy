@@ -23,8 +23,9 @@ count of pixels whose change deviates from the global illumination shift — a
 moving arm survives, camera auto-exposure cancels — giving one clean burst/step.
 
 Usage:
-  python scripts_pnp_lego/visualization_try_2_norankingviz.py \
-      --run_dir <run_dir> --score_sec 2.5
+python scripts_pnp_lego/visualization_try_2_norankingviz.py \
+    --run_dir /proj/vondrick3/sruthi/Appaji/diffusion_policy/data/jgd/realworld_data/jgd/2026.05.19/23.23.33_train_diffusion_unet_hybrid_stacking_image_10hz_wstate/checkpoints/epoch=0500-train_loss=0.0148/1jgd_3s_2026-05-21_15-42-35_VLM \
+    --denoise_steps 12 --denoise_sec 2
 """
 import argparse
 import glob
@@ -566,21 +567,19 @@ def cand_frame(cand, K, t_out, out_fps, speed=0.5, src_fps=CAND_SRC_FPS):
     return out
 
 
-def denoise_cand_imgs(cand, noise_imgs, K, p):
-    """Per-candidate frame mid diffusion-denoise dissolve, at progress p in
-    [0, 1] (0 = pure noise, 1 = the clip's clean first frame).
-
-    A smooth continuous crossfade from each cell's fixed colored-static image
-    (`noise_imgs[k]`) to its first generated frame (`cand[k][0]`). smoothstep
-    easing makes the detail resolve in pleasingly rather than linearly. This
-    instantly signals the clips are produced by a video diffusion model.
+def denoise_cand_imgs(cand, K, s, n_steps, seed):
+    """Per-candidate frame at discrete diffusion-denoise step `s` (0-based, of
+    `n_steps`). Each step crossfades further toward the clean first frame —
+    sigma = 1 - (s+1)/n_steps — and the noise is re-sampled every step so the
+    static visibly jumps, evoking iterative diffusion sampling. The last step is
+    fully clean (sigma=0), so it hands off seamlessly to clip playback.
     """
-    s = p * p * (3.0 - 2.0 * p)        # smoothstep
-    sigma = 1.0 - s                    # noise weight
+    sigma = 1.0 - (s + 1) / max(1, n_steps)
     out = []
     for k in range(K):
         target = cand[k][0].astype(np.float32)
-        noise = noise_imgs[k].astype(np.float32)
+        rng = np.random.default_rng(seed + k * 1000 + s)
+        noise = rng.integers(0, 256, target.shape, dtype=np.uint8).astype(np.float32)
         mix = (1.0 - sigma) * target + sigma * noise
         out.append(np.clip(mix, 0, 255).astype(np.uint8))
     return out
@@ -608,6 +607,10 @@ def main():
     ap.add_argument("--denoise_seed", type=int, default=0,
                     help="RNG seed for the per-candidate denoise static "
                          "(reproducible noise).")
+    ap.add_argument("--denoise_steps", type=int, default=8,
+                    help="number of discrete diffusion timesteps in the denoise "
+                         "intro (noise re-sampled each step, shown as a t=N->0 "
+                         "countdown). Higher = smoother.")
     ap.add_argument("--gen_hold", type=float, default=0.4,
                     help="seconds the candidate clips stay frozen on their last "
                          "frame after the play-through before the score appears.")
@@ -760,9 +763,7 @@ def main():
                                     n_out=n_out, n_denoise=n_denoise,
                                     executed=has_exec)
         n_out = len(states)
-        # fixed per-candidate colored static for the denoise dissolve
-        noise_imgs = [np.random.default_rng(args.denoise_seed + k).integers(
-            0, 256, cand[k][0].shape, dtype=np.uint8) for k in range(K)]
+        n_steps = max(1, args.denoise_steps)
         # sample exactly n_out source frames across the pause (monotonic,
         # forward-only); reuse the last read when n_out exceeds pause_len.
         left_frames = []
@@ -804,18 +805,24 @@ def main():
                 cyc = (t - first_win_t) // blink_period
                 if blink_halves == 0 or cyc < blink_halves:
                     blink_on = cyc % 2 == 0  # on, off, on, ... then solid
-            # diffusion denoise dissolve for the first n_denoise frames, then
-            # the clips play (cand_frame offset so play-once starts after it)
+            # stepped diffusion denoise for the first n_denoise frames (with a
+            # t=N->0 countdown), then the clips play (cand_frame offset so the
+            # play-through starts right after the denoise)
+            phase = st["phase"]
             if t < n_denoise:
-                p = (t + 1) / n_denoise
-                cand_imgs = denoise_cand_imgs(cand, noise_imgs, K, p)
+                s = min(n_steps - 1, int(t / n_denoise * n_steps))
+                cand_imgs = denoise_cand_imgs(cand, K, s, n_steps,
+                                              args.denoise_seed)
+                phase = (f"A video diffusion model denoises random noise into "
+                         f"{K} candidate futures   (diffusion step t = "
+                         f"{n_steps - s})")
             else:
                 cand_imgs = cand_frame(cand, K, t - n_denoise, fps,
                                        speed=args.cand_speed)
             frame = compose(
                 lf, f"Generating + scoring — {eff_speed}x speed up",
                 cand_imgs, geo,
-                st["phase"], st["phase_color"], st["votes"], st["winner_idx"],
+                phase, st["phase_color"], st["votes"], st["winner_idx"],
                 dim_left=st["dim_left"], dim_samples=st["dim_samples"],
                 winner_blink_on=blink_on)
             writer.write(frame)
