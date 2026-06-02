@@ -874,7 +874,7 @@ def main():
                 cand_imgs = cand_frame(cand, K, t - n_denoise, fps,
                                        speed=args.cand_speed)
             frame = compose(
-                lf, f"Generating + scoring — {eff_speed}x speed up",
+                lf, f"Generating + scoring — 5x speed up",
                 cand_imgs, geo,
                 phase, st["phase_color"], st["votes"], st["winner_idx"],
                 dim_left=st["dim_left"], dim_samples=st["dim_samples"],
