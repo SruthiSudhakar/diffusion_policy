@@ -24,8 +24,7 @@ moving arm survives, camera auto-exposure cancels — giving one clean burst/ste
 
 Usage:
 python scripts_pnp_lego/visualization_try_2_norankingviz.py \
-    --run_dir /proj/vondrick3/sruthi/Appaji/diffusion_policy/data/jgd/realworld_data/jgd/2026.05.19/23.23.33_train_diffusion_unet_hybrid_stacking_image_10hz_wstate/checkpoints/epoch=0500-train_loss=0.0148/1jgd_3s_2026-05-21_15-42-35_VLM \
-    --denoise_steps 12 --denoise_sec 2
+    --run_dir /proj/vondrick3/sruthi/Appaji/diffusion_policy/data/jgd/realworld_data/jgd/2026.05.19/23.23.33_train_diffusion_unet_hybrid_stacking_image_10hz_wstate/checkpoints/epoch=0500-train_loss=0.0148/1jgd_3s_2026-05-21_15-42-35_VLM
 """
 import argparse
 import glob
@@ -71,13 +70,18 @@ LOSE = (210, 80, 90)          # red
 BAR_BG = (55, 60, 72)
 HILITE = (250, 205, 70)       # yellow: active comparison
 
-# Left (real robot) panel
-LEFT_X0, LEFT_X1 = PAD, 744
-# Right region: grid of candidate videos + ranking
-RIGHT_X0 = 762
-RIGHT_X1 = W - PAD
-# vertical space reserved under each candidate video for its label + vote bar
-LABEL_H = 52
+# Stacked layout: Real Robot panel on top (full width), Generated Samples grid
+# below it (full width). A thin header strip at the very top holds the phase
+# narration.
+ROBOT_X0, ROBOT_X1 = PAD, W - PAD
+ROBOT_Y0 = PAD
+ROBOT_Y1 = 642
+SAMP_X0, SAMP_X1 = PAD, W - PAD
+SAMP_Y0 = ROBOT_Y1 + PAD
+SAMP_Y1 = H - PAD
+# vertical space reserved under each candidate video for its score bar (the
+# "Sample N" label is overlaid on the video itself)
+LABEL_H = 36
 
 
 # ---------------------------------------------------------------------------
@@ -342,8 +346,39 @@ def find_execution_bursts(sig, fps, n_expected, min_dur=0.25, merge_gap=0.8,
 def base_canvas():
     img = np.empty((H, W, 3), np.uint8)
     img[:] = BG
-    fill_rect(img, 0, 0, W, HEADER_H, PANEL_BG)
     return img
+
+
+def overlay_tag(img, tl, x, y, text, size, color=TEXT, anchor="lt", pad=5):
+    """Draw `text` on a darkened plate so it reads over video. `anchor` gives
+    which corner (x, y) is: lt=left-top, rt=right-top, rb=right-bottom,
+    lb=left-bottom."""
+    w = int(len(text) * size * 0.62) + 2 * pad
+    h = size + 2 * pad
+    rx0 = x - w if anchor in ("rt", "rb") else x
+    ry0 = y - h if anchor in ("rb", "lb") else y
+    rx1, ry1 = rx0 + w, ry0 + h
+    # semi-transparent dark plate behind the text
+    H_, W_ = img.shape[:2]
+    cx0, cy0 = max(0, rx0), max(0, ry0)
+    cx1, cy1 = min(W_, rx1), min(H_, ry1)
+    if cx1 > cx0 and cy1 > cy0:
+        roi = img[cy0:cy1, cx0:cx1].astype(np.float32) * 0.3
+        img[cy0:cy1, cx0:cx1] = roi.astype(np.uint8)
+    tl.add((rx0 + pad, ry0 + pad), text, size, color, bold=True, anchor="la")
+
+
+def rows_for(K, cols, rows_arrangement):
+    """Resolve the per-row sample counts: explicit `rows_arrangement` if it sums
+    to K, else rows of `cols`."""
+    if rows_arrangement and sum(rows_arrangement) == K:
+        return list(rows_arrangement)
+    cols = max(1, min(cols, K))
+    arr, left = [], K
+    while left > 0:
+        arr.append(min(cols, left))
+        left -= min(cols, left)
+    return arr
 
 
 def grid_geometry(K, cols=3, rows_arrangement=None):
@@ -355,18 +390,10 @@ def grid_geometry(K, cols=3, rows_arrangement=None):
     keeping the 848:480 aspect ratio, and each row is centered horizontally.
     Returns a list of (thumb_x, thumb_y, thumb_w, thumb_h, cell_x0, cell_w).
     """
-    if rows_arrangement and sum(rows_arrangement) == K:
-        arr = list(rows_arrangement)
-    else:
-        cols = max(1, min(cols, K))
-        arr, left = [], K
-        while left > 0:
-            arr.append(min(cols, left))
-            left -= min(cols, left)
+    arr = rows_for(K, cols, rows_arrangement)
     R = len(arr)
-    top = HEADER_H + PAD
-    avail_w = RIGHT_X1 - RIGHT_X0
-    avail_h = H - top - PAD
+    avail_w = SAMP_X1 - SAMP_X0
+    avail_h = SAMP_Y1 - SAMP_Y0
     gx, gy = 20, 14
     row_h = (avail_h - (R - 1) * gy) / R
     th_box = row_h - LABEL_H
@@ -379,8 +406,8 @@ def grid_geometry(K, cols=3, rows_arrangement=None):
     k = 0
     for r, c in enumerate(arr):
         row_w = c * tw + (c - 1) * gx
-        x_start = RIGHT_X0 + (avail_w - row_w) / 2  # center this row
-        y0 = top + r * (row_h + gy)
+        x_start = SAMP_X0 + (avail_w - row_w) / 2  # center this row
+        y0 = SAMP_Y0 + r * (row_h + gy)
         for j in range(c):
             tx = int(x_start + j * (tw + gx))
             geo.append((tx, int(y0), tw, th, tx, tw))
@@ -388,15 +415,19 @@ def grid_geometry(K, cols=3, rows_arrangement=None):
     return geo
 
 
-def draw_left(img, left_frame, label, tl):
-    box_w = LEFT_X1 - LEFT_X0
-    box_h = H - (HEADER_H + PAD) - PAD - 30
-    y0 = HEADER_H + PAD
-    fill_rect(img, LEFT_X0, y0, LEFT_X1, y0 + box_h, PANEL_BG)
-    r, ox, oy = fit_into(left_frame, box_w, box_h)
-    paste(img, r, LEFT_X0 + ox, y0 + oy)
-    border_rect(img, LEFT_X0, y0, LEFT_X1, y0 + box_h, (70, 76, 90), 2)
-    tl.add((LEFT_X0 + 6, y0 + box_h + 4), label, 22, SUBTLE, bold=True)
+def draw_left(img, robot_frame, label, tl, dim=False):
+    """Draw the Real Robot video in the full-width top panel. The "Real Robot"
+    label is overlaid on the top-left of the video and the status caption
+    (speed / "Executing Sample W") on the bottom-right."""
+    x0, x1, y0, y1 = ROBOT_X0, ROBOT_X1, ROBOT_Y0, ROBOT_Y1
+    r, ox, oy = fit_into(robot_frame, x1 - x0, y1 - y0)
+    vx0, vy0 = x0 + ox, y0 + oy
+    vx1, vy1 = vx0 + r.shape[1], vy0 + r.shape[0]
+    paste(img, r, vx0, vy0)
+    overlay_tag(img, tl, vx0 + 8, vy0 + 8, "Real Robot", 30,
+                SUBTLE if dim else TEXT, anchor="lt")
+    if label:
+        overlay_tag(img, tl, vx1 - 8, vy1 - 8, label, 22, SUBTLE, anchor="rb")
 
 
 def compose(left_frame, left_label, cand_imgs, geo, phase, phase_color,
@@ -415,22 +446,14 @@ def compose(left_frame, left_label, cand_imgs, geo, phase, phase_color,
     img = base_canvas()
     tl = TextLayer(img)
 
-    # header: a title box over each panel + the phase narration. The title of
-    # the dimmed side is muted so the focus shift reads clearly.
-    fill_rect(img, LEFT_X0, 8, LEFT_X1, HEADER_H - 8, BAR_BG)
-    fill_rect(img, RIGHT_X0, 8, RIGHT_X1, HEADER_H - 8, BAR_BG)
-    tl.add(((LEFT_X0 + LEFT_X1) // 2, HEADER_H // 2), "Real Robot", 30,
-           SUBTLE if dim_left else TEXT, bold=True, anchor="mm")
-    tl.add((RIGHT_X0 + 12, 12), "Generated Samples", 28,
-           SUBTLE if dim_samples else TEXT, bold=True)
-    tl.add((RIGHT_X0 + 12, 50), phase, 20, phase_color)
-
     lf = ((left_frame.astype(np.float32) * 0.35).astype(np.uint8)
           if dim_left else left_frame)
-    draw_left(img, lf, left_label, tl)
+    draw_left(img, lf, left_label, tl, dim=dim_left)
 
     K = len(cand_imgs)
-    max_votes = max(votes) if (votes and max(votes) > 0) else 1
+    # bars show each sample's pairwise win count out of the K-1 head-to-head
+    # comparisons it took part in, so near-ties read as similar bar lengths.
+    win_denom = max(1, K - 1, (max(votes) if votes else 0))
     for k in range(K):
         tx, ty, tw, th, cx0, cw = geo[k]
         is_winner = winner_idx is not None and k == winner_idx
@@ -445,25 +468,26 @@ def compose(left_frame, left_label, cand_imgs, geo, phase, phase_color,
             bcol, bt = (WIN if winner_blink_on else WIN_DIM), 5
         border_rect(img, tx, ty, tx + tw, ty + th, bcol, bt)
 
-        # ---- label + global score bar underneath the video ----
-        lab_col = WIN if is_winner else TEXT
-        uy = ty + th + 5
-        tl.add((tx, uy), f"Sample {k}", 21, lab_col, bold=True)
+        # "Sample N" overlaid top-left of the video; "SELECTED" top-right
+        overlay_tag(img, tl, tx + 6, ty + 6, f"Candidate {k}", 19,
+                    WIN if is_winner else TEXT, anchor="lt")
         if is_winner and votes is not None:
             tag_col = WIN if winner_blink_on else WIN_DIM
-            tl.add((tx + tw, uy), "SELECTED", 20, tag_col, bold=True,
-                   anchor="ra")
+            overlay_tag(img, tl, tx + tw - 6, ty + 6, "SELECTED", 18, tag_col,
+                        anchor="rt")
 
+        # win-count bar underneath the video (number of head-to-head wins)
         if votes is not None:
-            by0 = uy + 27
+            by0 = ty + th + 8
             by1 = by0 + 16
-            tl.add((tx, by0 - 3), "Ranking:", 18, SUBTLE, bold=True)
-            bx0, bx1 = tx + 92, tx + tw - 36
+            tl.add((tx, by0 - 3), "Wins:", 18, SUBTLE, bold=True)
+            bx0, bx1 = tx + 66, tx + tw - 52
             fill_rect(img, bx0, by0, bx1, by1, BAR_BG)
-            frac = votes[k] / max_votes
+            frac = votes[k] / win_denom
             fcol = WIN if is_winner else ACCENT
             fill_rect(img, bx0, by0, bx0 + int((bx1 - bx0) * frac), by1, fcol)
-            tl.add((bx1 + 6, by0 - 3), str(votes[k]), 19, TEXT, bold=True)
+            tl.add((bx1 + 6, by0 - 3), f"{votes[k]}/{K - 1}", 19, TEXT,
+                   bold=True)
 
     return tl.flush()
 
@@ -600,14 +624,14 @@ def main():
                     help="playback speed of the generated candidate clips "
                          "(0.5 = half speed). Each clip plays through once then "
                          "freezes on its last frame while ranking proceeds.")
-    ap.add_argument("--denoise_sec", type=float, default=1.2,
+    ap.add_argument("--denoise_sec", type=float, default=2,
                     help="seconds of the diffusion denoise dissolve (random "
                          "noise -> each clip's first frame) shown before the "
                          "candidates play. 0 disables it.")
     ap.add_argument("--denoise_seed", type=int, default=0,
                     help="RNG seed for the per-candidate denoise static "
                          "(reproducible noise).")
-    ap.add_argument("--denoise_steps", type=int, default=8,
+    ap.add_argument("--denoise_steps", type=int, default=50,
                     help="number of discrete diffusion timesteps in the denoise "
                          "intro (noise re-sampled each step, shown as a t=N->0 "
                          "countdown). Higher = smoother.")
@@ -624,15 +648,20 @@ def main():
                     help="number of times the winner box flashes when it first "
                          "appears, then it holds solid green. 0 = blink for the "
                          "whole score phase.")
-    ap.add_argument("--grid_cols", type=int, default=3,
+    ap.add_argument("--content_width", type=int, default=1280,
+                    help="display width (px) of the Real Robot video; the whole "
+                         "canvas is sized to fit exactly this wide content "
+                         "(robot video on top, samples grid below).")
+    ap.add_argument("--grid_cols", type=int, default=5,
                     help="columns in the candidate-video grid, used when "
-                         "--grid_rows does not apply (e.g. 10 samples -> 3 "
-                         "cols). Fewer columns => bigger, wider videos.")
-    ap.add_argument("--grid_rows", default="2,2,1",
+                         "--grid_rows does not apply (e.g. 10 samples -> 5 "
+                         "cols = two rows).")
+    ap.add_argument("--grid_rows", default="3,2",
                     help="explicit per-row sample counts, comma-separated "
-                         "(default '2,2,1' for 5 samples -> big videos). Used "
-                         "only when it sums to the number of samples; otherwise "
-                         "falls back to --grid_cols. Pass '' to always use cols.")
+                         "(default '3,2' for 5 samples -> a 3-then-2 pyramid "
+                         "under the Real Robot panel). Used only when it sums "
+                         "to the number of samples; otherwise falls back to "
+                         "--grid_cols. Pass '' to always use cols.")
     ap.add_argument("--exec_pad_pre", type=float, default=0.25,
                     help="seconds of real-time lead-in before each detected "
                          "execution burst")
@@ -718,10 +747,6 @@ def main():
                   f"({(pe - ps + 1)/fps_in:5.1f}s) | no execution (pause-only)")
 
     fps = args.fps
-    writer = Writer(out_path, fps)
-    cap = cv2.VideoCapture(str(rollout_path))
-    cur_idx = 0
-    total_out = 0
     rows_arr = None
     if args.grid_rows.strip():
         try:
@@ -729,8 +754,37 @@ def main():
         except ValueError:
             print(f"[warn] could not parse --grid_rows '{args.grid_rows}'; "
                   f"using --grid_cols {args.grid_cols}")
-    K0 = len(glob.glob(os.path.join(steps[0], "*.mp4")))
-    geo = grid_geometry(max(1, K0), args.grid_cols, rows_arr)
+    K0 = max(1, len(glob.glob(os.path.join(steps[0], "*.mp4"))))
+
+    # ---- size the canvas to exactly fit the content (no wasted margins) ----
+    # Real Robot video (16:9) on top at content_width; samples grid (848:480)
+    # below, the widest row also spanning content_width.
+    global W, H, ROBOT_X0, ROBOT_X1, ROBOT_Y0, ROBOT_Y1
+    global SAMP_X0, SAMP_X1, SAMP_Y0, SAMP_Y1
+    arr = rows_for(K0, args.grid_cols, rows_arr)
+    gx, gy = 20, 14
+    RW = max(320, args.content_width)
+    RH = int(round(RW * 360 / 640))
+    max_c = max(arr)
+    SW = (RW - (max_c - 1) * gx) // max_c
+    SH = int(round(SW * 480 / 848))
+    grid_h = len(arr) * (SH + LABEL_H) + (len(arr) - 1) * gy
+    W = PAD + RW + PAD
+    H = PAD + RH + PAD + grid_h + PAD
+    W += W % 2                      # libx264 needs even dimensions
+    H += H % 2
+    ROBOT_X0, ROBOT_X1, ROBOT_Y0, ROBOT_Y1 = PAD, PAD + RW, PAD, PAD + RH
+    SAMP_X0, SAMP_X1 = PAD, PAD + RW
+    SAMP_Y0 = ROBOT_Y1 + PAD
+    SAMP_Y1 = SAMP_Y0 + grid_h
+    print(f"[layout] canvas {W}x{H}, robot {RW}x{RH}, sample {SW}x{SH}, "
+          f"rows {arr}")
+
+    writer = Writer(out_path, fps)
+    cap = cv2.VideoCapture(str(rollout_path))
+    cur_idx = 0
+    total_out = 0
+    geo = grid_geometry(K0, args.grid_cols, rows_arr)
 
     for si, step_dir in enumerate(steps):
         ranking, cand = load_step(step_dir)
