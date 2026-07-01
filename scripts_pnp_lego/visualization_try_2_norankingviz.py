@@ -368,6 +368,36 @@ def overlay_tag(img, tl, x, y, text, size, color=TEXT, anchor="lt", pad=5):
     tl.add((rx0 + pad, ry0 + pad), text, size, color, bold=True, anchor="la")
 
 
+def overlay_result(frame, success):
+    """Stamp the rollout outcome on an already-composed frame: a colored border
+    around the whole canvas plus a compact pill (green check + SUCCESS /
+    red cross + FAILED) near the TOP of the Real Robot panel, so the center of
+    the final frame stays unobstructed."""
+    H_, W_ = frame.shape[:2]
+    col = WIN if success else LOSE
+    label = "SUCCESS" if success else "FAILED"
+    bt = 16
+    border_rect(frame, bt // 2, bt // 2, W_ - bt // 2, H_ - bt // 2, col, bt)
+    cx = W_ // 2
+    pw, ph = 340, 78
+    cy = ROBOT_Y0 + 26 + ph // 2  # sit near the top, not the middle
+    x0, y0, x1, y1 = cx - pw // 2, cy - ph // 2, cx + pw // 2, cy + ph // 2
+    fill_rect(frame, x0, y0, x1, y1, col)
+    border_rect(frame, x0, y0, x1, y1, (255, 255, 255), 2)
+    white = (255, 255, 255)
+    gx = x0 + 52
+    if success:
+        cv2.line(frame, (gx - 22, cy + 2), (gx - 6, cy + 20), white, 7, cv2.LINE_AA)
+        cv2.line(frame, (gx - 6, cy + 20), (gx + 26, cy - 22), white, 7, cv2.LINE_AA)
+    else:
+        cv2.line(frame, (gx - 20, cy - 20), (gx + 20, cy + 20), white, 7, cv2.LINE_AA)
+        cv2.line(frame, (gx - 20, cy + 20), (gx + 20, cy - 20), white, 7, cv2.LINE_AA)
+    tl = TextLayer(frame)
+    tl.add(((gx + 34 + x1) // 2, cy + 1), label, 40, white, bold=True,
+           anchor="mm")
+    tl.flush()
+
+
 def rows_for(K, cols, rows_arrangement):
     """Resolve the per-row sample counts: explicit `rows_arrangement` if it sums
     to K, else rows of `cols`."""
@@ -430,9 +460,12 @@ def draw_left(img, robot_frame, label, tl, dim=False):
         overlay_tag(img, tl, vx1 - 8, vy1 - 8, label, 22, SUBTLE, anchor="rb")
 
 
+DIM = 0.35  # brightness multiplier for the dimmed (out-of-focus) panel
+
+
 def compose(left_frame, left_label, cand_imgs, geo, phase, phase_color,
             votes, winner_idx, dim_left=False, dim_samples=False,
-            winner_blink_on=True):
+            winner_blink_on=True, left_bright=None, samp_bright=None):
     """Render one output frame.
 
     votes           : global VLM score list[int] (len K) shown below each
@@ -442,13 +475,20 @@ def compose(left_frame, left_label, cand_imgs, geo, phase, phase_color,
     dim_samples     : darken all candidate videos (focus is on the robot)
     winner_blink_on : when False, draw the winner box in dim green instead of
                       bright green (drives the acceptance blink)
+    left_bright /
+    samp_bright     : explicit brightness multipliers in [0, 1] that override
+                      dim_left / dim_samples (used to crossfade the focus shift
+                      smoothly instead of a hard cut)
     """
     img = base_canvas()
     tl = TextLayer(img)
 
-    lf = ((left_frame.astype(np.float32) * 0.35).astype(np.uint8)
-          if dim_left else left_frame)
-    draw_left(img, lf, left_label, tl, dim=dim_left)
+    lb = left_bright if left_bright is not None else (DIM if dim_left else 1.0)
+    sb = samp_bright if samp_bright is not None else (DIM if dim_samples else 1.0)
+
+    lf = ((left_frame.astype(np.float32) * lb).astype(np.uint8)
+          if lb < 0.999 else left_frame)
+    draw_left(img, lf, left_label, tl, dim=lb < 0.9)
 
     K = len(cand_imgs)
     # bars show each sample's pairwise win count out of the K-1 head-to-head
@@ -459,8 +499,8 @@ def compose(left_frame, left_label, cand_imgs, geo, phase, phase_color,
         is_winner = winner_idx is not None and k == winner_idx
 
         thumb = cv2.resize(cand_imgs[k], (tw, th), interpolation=cv2.INTER_AREA)
-        if dim_samples:
-            thumb = (thumb.astype(np.float32) * 0.35).astype(np.uint8)
+        if sb < 0.999:
+            thumb = (thumb.astype(np.float32) * sb).astype(np.uint8)
         paste(img, thumb, tx, ty)
 
         bcol, bt = (70, 76, 90), 2
@@ -648,6 +688,20 @@ def main():
                     help="number of times the winner box flashes when it first "
                          "appears, then it holds solid green. 0 = blink for the "
                          "whole score phase.")
+    ap.add_argument("--outcome", choices=["success", "failure"], default=None,
+                    help="if given, hold an end card at the end of the video "
+                         "stamping the rollout result (green SUCCESS / red "
+                         "FAILED) over the final robot frame.")
+    ap.add_argument("--result_sec", type=float, default=2.5,
+                    help="seconds to hold the success/failure end card.")
+    ap.add_argument("--input_sec", type=float, default=0.6,
+                    help="seconds to open on the bright robot input observation "
+                         "(undimmed) before it dims and generation begins. "
+                         "0 disables the intro.")
+    ap.add_argument("--input_frame_idx", type=int, default=60,
+                    help="rollout frame to freeze on for the input intro "
+                         "(default 60 — skips the dark auto-exposure ramp at "
+                         "the very start).")
     ap.add_argument("--content_width", type=int, default=1280,
                     help="display width (px) of the Real Robot video; the whole "
                          "canvas is sized to fit exactly this wide content "
@@ -806,13 +860,21 @@ def main():
         # generation = diffusion denoise dissolve -> clip play-through -> hold
         n_denoise = max(0, int(round(args.denoise_sec * fps)))
         n_gen = n_denoise + play_once + int(round(args.gen_hold * fps))
-        n_score = max(1, int(round(args.score_sec * fps)))
-        # narration length drives the pause; if the real pause is longer than
-        # 10x of it, we'd be too fast, so take whichever is longer and sample
-        # the (static) robot frames to fit.
+        # Winner-blink timing computed up front: the SCORE PHASE *is* the blink.
+        # The green winner appears together with the score bars, flashes `count`
+        # times, lands on a one-period solid tail, then execution begins — so
+        # there is no bars-only delay before the green and no solid-green hold
+        # after the blink.
+        blink_period = (max(1, int(round(fps / (2 * args.winner_blink_hz))))
+                        if args.winner_blink_hz > 0 else 0)
+        blink_halves = 2 * max(0, args.winner_blink_count)  # on+off per blink
+        blink_total = (blink_halves + 1) * blink_period      # flashes + tail
+        n_score = (blink_total if blink_total > 0
+                   else max(1, int(round(args.score_sec * fps))))
+        # the paused robot is held still, so just sample it to the narration
+        # length — no extra hold-padding that would stretch the score phase.
         narration = n_gen + n_score
-        n_out = max(narration,
-                    int(np.ceil(pause_len / max(1, args.pause_speedup))))
+        n_out = narration
         states = build_pause_states(votes_final, winner_idx, K, n_gen, n_score,
                                     n_out=n_out, n_denoise=n_denoise,
                                     executed=has_exec)
@@ -843,22 +905,54 @@ def main():
         if not left_frames:
             left_frames = [np.full((360, 640, 3), 40, np.uint8)]
         eff_speed = max(1, int(round(pause_len / max(1, n_out))))
-        # blink the winner box a fixed number of times when it first appears,
-        # then hold solid green.
-        blink_period = (max(1, int(round(fps / (2 * args.winner_blink_hz))))
-                        if args.winner_blink_hz > 0 else 0)
-        blink_halves = 2 * max(0, args.winner_blink_count)  # on+off per blink
+        # the winner flashes from the moment the scores appear (= start of the
+        # score phase), ending on the solid tail right before execution.
         first_win_t = next((i for i, s in enumerate(states)
                             if s["winner_idx"] is not None), None)
+        blink_start = first_win_t if first_win_t is not None else n_out
+
+        # input intro (step 0 only): open on the bright robot observation (the
+        # system's input) with the candidates ALREADY present as raw diffusion
+        # noise (dimmed, exactly like every other step's out-of-focus samples).
+        # Then it hard-switches into generation (robot dims, candidates
+        # brighten) — the same cut used between all the later steps. Because the
+        # noise candidates are already on screen, nothing "pops up". Use a frame
+        # a little way in (default 60) to skip the dark exposure ramp.
+        if si == 0 and args.input_sec > 0:
+            n_hold = max(1, int(round(args.input_sec * fps)))
+            intro_frame = left_frames[0]
+            cap2 = cv2.VideoCapture(str(rollout_path))
+            cap2.set(cv2.CAP_PROP_POS_FRAMES, max(0, args.input_frame_idx))
+            ok2, f2 = cap2.read()
+            cap2.release()
+            if ok2:
+                intro_frame = cv2.cvtColor(cv2.resize(f2, (640, 360)),
+                                           cv2.COLOR_BGR2RGB)
+            # candidates start as exactly what the generation phase shows first
+            # (denoise step 0 noise), so the handoff is seamless.
+            if n_denoise > 0:
+                intro_cands = denoise_cand_imgs(cand, K, 0, n_steps,
+                                                args.denoise_seed)
+            else:
+                intro_cands = cand_frame(cand, K, 0, fps, speed=args.cand_speed)
+            for _ in range(n_hold):
+                frame = compose(intro_frame, "Input observation", intro_cands,
+                                geo, "", ACCENT, None, None,
+                                dim_left=False, dim_samples=True)
+                writer.write(frame)
+                total_out += 1
+
         for t in range(n_out):
             st = states[t]
             lf = left_frames[min(t, len(left_frames) - 1)]
+            # the green winner is shown for the whole score phase and flashes
+            # `count` times from its first frame, then a solid tail before exec.
             blink_on = True
-            if (blink_period and st["winner_idx"] is not None
-                    and first_win_t is not None):
-                cyc = (t - first_win_t) // blink_period
-                if blink_halves == 0 or cyc < blink_halves:
-                    blink_on = cyc % 2 == 0  # on, off, on, ... then solid
+            if (blink_period and blink_halves and st["winner_idx"] is not None
+                    and t >= blink_start):
+                cyc = (t - blink_start) // blink_period
+                if cyc < blink_halves:
+                    blink_on = cyc % 2 == 0  # flash; solid tail lands bright
             # stepped diffusion denoise for the first n_denoise frames (with a
             # t=N->0 countdown), then the clips play (cand_frame offset so the
             # play-through starts right after the denoise)
@@ -902,6 +996,20 @@ def main():
         del cand
         print(f"[step {si}] done. cumulative out frames={total_out} "
               f"(~{total_out / fps:.1f}s)")
+
+    # ---------- end card: stamp the rollout outcome on the final frame ----------
+    if args.outcome is not None:
+        success = args.outcome == "success"
+        n_end = max(1, int(round(args.result_sec * fps)))
+        for _ in range(n_end):
+            frame = compose(lf, "", win_cand_last, geo, "", WIN,
+                            list(votes_final), winner_idx,
+                            dim_left=False, dim_samples=True)
+            overlay_result(frame, success)
+            writer.write(frame)
+            total_out += 1
+        print(f"[result] stamped {args.outcome.upper()} end card "
+              f"({n_end} frames)")
 
     cap.release()
     writer.close()

@@ -9,10 +9,8 @@ each. Renders run concurrently (``--jobs``) so a big sweep doesn't take forever.
 
 Any unrecognized flags are forwarded verbatim to the visualization script, e.g.
 
-    python scripts_pnp_lego/run_all_visualizations.py \
-        /proj/.../checkpoints/epoch=0200-train_loss=0.0116 \
-        --jobs 12 --skip_existing -- --denoise_steps 12 --content_width 1280
-
+python scripts_pnp_lego/run_all_visualizations.py \
+    /proj/vondrick3/sruthi/Appaji/diffusion_policy/data/jgd/realworld_data/jgd/2026.05.19/23.23.33_train_diffusion_unet_hybrid_stacking_image_10hz_wstate/checkpoints/epoch=0500-train_loss=0.0148
 (everything after ``--`` — or any flag this script doesn't define — is passed
 through to each visualization invocation).
 """
@@ -21,12 +19,31 @@ import concurrent.futures as cf
 import fnmatch
 import glob
 import os
+import re
 import subprocess
 import sys
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_SCRIPT = os.path.join(HERE, "visualization_try_2_norankingviz.py")
+
+
+def detect_outcome(run_dir):
+    """Infer success/failure from the run-dir name. Splitting the basename on
+    '_', a token of the form '<number>s' (e.g. '6s', '3s' — the rollout
+    duration) means success, while a lone 'f' token means failure. Returns
+    'success', 'failure', or None if neither marker is present."""
+    name = os.path.basename(run_dir.rstrip("/"))
+    for tok in name.split("_"):
+        if tok=="ss":
+            return "success"
+        if tok=="sf" or tok=="ff":
+            return "failure"
+        if tok == "f":
+            return "failure"
+        if re.fullmatch(r"\d+s", tok):
+            return "success"
+    return None
 
 
 def find_run_dirs(root, pattern):
@@ -66,12 +83,15 @@ def main():
                          "visualization_try_2_norankingviz.py)")
     ap.add_argument("--pattern", default="*VLM",
                     help="glob for run-dir basenames (default '*VLM')")
-    ap.add_argument("--jobs", "-j", type=int, default=8,
+    ap.add_argument("--jobs", "-j", type=int, default=50,
                     help="number of renders to run in parallel (default 8)")
     ap.add_argument("--skip_existing", action="store_true",
                     help="skip run dirs that already have a visualization mp4")
     ap.add_argument("--dry_run", action="store_true",
                     help="just list the run dirs that would be rendered")
+    ap.add_argument("--no_auto_outcome", action="store_true",
+                    help="do not infer --outcome (success/failure) from the "
+                         "run-dir name")
     args, passthrough = ap.parse_known_args()
     # allow an explicit '--' separator before pass-through args
     if passthrough and passthrough[0] == "--":
@@ -86,10 +106,23 @@ def main():
     if args.skip_existing:
         run_dirs = [d for d in run_dirs if not has_output(d)]
     n = len(run_dirs)
+
+    # infer the success/failure end card from each run-dir name, unless the
+    # user disabled it or already passed --outcome through.
+    auto = not args.no_auto_outcome and "--outcome" not in passthrough
+    outcomes = {d: (detect_outcome(d) if auto else None) for d in run_dirs}
+
     print(f"[scan] {n} run dir(s) matching '{args.pattern}' under {args.root}"
           + (" (skipping ones with existing output)" if args.skip_existing else ""))
     for d in run_dirs:
-        print(f"   - {d}")
+        oc = outcomes[d]
+        tag = f"[{oc}]" if oc else ("[outcome?]" if auto else "")
+        print(f"   - {tag:>11} {d}")
+    if auto:
+        n_unknown = sum(1 for d in run_dirs if outcomes[d] is None)
+        if n_unknown:
+            print(f"[warn] {n_unknown} dir(s) had no success/failure marker in "
+                  f"their name -> rendered without an end card")
     if not n:
         return
     if args.dry_run:
@@ -101,18 +134,23 @@ def main():
     ok, failed = [], []
     done = 0
     with cf.ThreadPoolExecutor(max_workers=max(1, args.jobs)) as ex:
-        futs = {ex.submit(render_one, d, args.script, passthrough): d
-                for d in run_dirs}
+        futs = {}
+        for d in run_dirs:
+            pt = list(passthrough)
+            if outcomes[d]:
+                pt += ["--outcome", outcomes[d]]
+            futs[ex.submit(render_one, d, args.script, pt)] = d
         for fut in cf.as_completed(futs):
             run_dir, rc, dt, out, err = fut.result()
             done += 1
             name = os.path.relpath(run_dir, args.root)
+            oc = outcomes[run_dir] or "-"
             if rc == 0:
                 ok.append(run_dir)
                 # echo the script's final "[done] wrote ..." line if present
                 last = next((ln for ln in reversed(out.splitlines())
                              if "[done]" in ln), "")
-                print(f"[{done}/{n}] OK   ({dt:5.0f}s)  {name}")
+                print(f"[{done}/{n}] OK   ({dt:5.0f}s) [{oc:>7}]  {name}")
                 if last:
                     print(f"           {last.strip()}")
             else:
